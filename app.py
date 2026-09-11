@@ -48,24 +48,38 @@ def calculate(
     upside = (result.value_per_share / current_price - 1) * 100
     verdict = "undervalued" if upside > 0 else "overvalued"
 
-    summary = f"""
-### Intrinsic Value: **${result.value_per_share:,.2f} per share**
+    if upside > 10:
+        signal = "BUY"
+    elif upside < -10:
+        signal = "SELL"
+    else:
+        signal = "HOLD"
 
-Current price: ${current_price:,.2f} → implies stock is **{abs(upside):.1f}% {verdict}**
+    scorecard = f"""
+## Results
 
-| Component | Value |
+| Metric | Value |
+|---|---|
+| **Intrinsic Value / Share** | **${result.value_per_share:,.2f}** |
+| **Enterprise Value** | **${result.enterprise_value:,.1f}B** |
+| **Current Price** | **${current_price:,.2f}** |
+| **Upside / Downside** | **{'+' if upside >= 0 else ''}{upside:,.1f}% ({verdict})** |
+| **Signal** | **{signal}** |
+
+*Signal rule of thumb: BUY if >10% undervalued, SELL if >10% overvalued, HOLD otherwise.*
+
+| Value Bridge | Amount |
 |---|---|
 | PV of forecast-period cash flows | ${result.pv_of_forecast_years:,.1f}B |
-| Terminal value (undiscounted) | ${result.terminal_value:,.1f}B |
 | PV of terminal value | ${result.pv_of_terminal_value:,.1f}B |
-| Enterprise value | ${result.enterprise_value:,.1f}B |
+| = Enterprise value | ${result.enterprise_value:,.1f}B |
 | + Cash | ${cash:,.1f}B |
 | − Debt | ${debt:,.1f}B |
 | = Equity value | ${result.equity_value:,.1f}B |
 | ÷ Shares outstanding | {shares:,.1f}B |
 """
 
-    return summary, table
+    return scorecard, table
 
 
 with gr.Blocks(title="DCF Valuation") as demo:
@@ -91,19 +105,19 @@ with gr.Blocks(title="DCF Valuation") as demo:
             wacc = gr.Slider(1, 20, value=11, label="WACC (%)")
             horizon = gr.Slider(3, 15, value=10, step=1, label="Forecast Horizon (Years)")
 
-    calculate_btn = gr.Button("Calculate Intrinsic Value", variant="primary")
-
     summary_output = gr.Markdown()
     table_output = gr.Dataframe(label="Year-by-Year Projection")
 
-    calculate_btn.click(
-        fn=calculate,
-        inputs=[
-            revenue, growth_y1, growth_y5, growth_terminal, gross_margin,
-            opex_pct, tax_rate, wacc, horizon, cash, debt, shares, current_price,
-        ],
-        outputs=[summary_output, table_output],
-    )
+    all_inputs = [
+        revenue, growth_y1, growth_y5, growth_terminal, gross_margin,
+        opex_pct, tax_rate, wacc, horizon, cash, debt, shares, current_price,
+    ]
+    all_outputs = [summary_output, table_output]
+
+    for component in all_inputs:
+        component.change(fn=calculate, inputs=all_inputs, outputs=all_outputs)
+
+    demo.load(fn=calculate, inputs=all_inputs, outputs=all_outputs)
 
 if __name__ == "__main__":
     demo.launch(share=os.environ.get("GRADIO_SHARE") == "1")
