@@ -221,10 +221,13 @@ def build_sensitivity_heatmap(
 #          BUY/HOLD/SELL CALL, BREAK-EVEN
 #
 # Each scenario varies the assumptions that matter most (Year 1 & Year 5
-# growth, Year 1 & Year 5 margin, terminal growth, WACC) while sharing every
-# other input (base revenue, Years 2-4, long-term growth, tax, capex%, NWC%,
-# balance sheet) with the main model above. All three still run through the
-# unmodified run_dcf() from dcf.py.
+# growth, Year 1 & Year 5 margin, terminal growth, WACC). Years 2-4 are no
+# longer tied to the main model's shared sliders — each scenario linearly
+# interpolates its own Years 2-4 between its own Year 1 and Year 5 values, so
+# every scenario's path is internally consistent. Base revenue, long-term
+# growth, tax, capex%, NWC%, and the balance sheet remain shared with the
+# main model above. All three still run through the unmodified run_dcf()
+# from dcf.py.
 # =============================================================================
 
 BUY_SELL_THRESHOLD_PCT = 10.0  # same rule of thumb used earlier: >10% mispricing triggers a call
@@ -234,10 +237,15 @@ BUY_SELL_THRESHOLD_PCT = 10.0  # same rule of thumb used earlier: >10% mispricin
 _BASE_WACC_DEFAULT = round(CASE_RISK_FREE_RATE + CASE_BETA_DEFAULT * CASE_EQUITY_RISK_PREMIUM, 2)
 
 
+def _interpolate_years_2_to_4(year1_value, year5_value):
+    """Linearly interpolate Years 2-4 between a scenario's own Year 1 and
+    Year 5 values (same 4-step interpolation used for the Year 6-10 fade)."""
+    return [year1_value + (year5_value - year1_value) * fraction for fraction in (0.25, 0.50, 0.75)]
+
+
 def _scenario_value_per_share(
     growth_y1, growth_y5, margin_y1, margin_y5, terminal_growth, wacc,
-    base_revenue, revenue_growth_y2, revenue_growth_y3, revenue_growth_y4, revenue_growth_long_term,
-    operating_margin_y2, operating_margin_y3, operating_margin_y4,
+    base_revenue, revenue_growth_long_term,
     tax_rate, capex_pct_revenue, nwc_pct_revenue,
     equity_risk_premium, beta,
     cash_and_securities, nonmarketable_securities, total_debt, shares_outstanding,
@@ -248,15 +256,19 @@ def _scenario_value_per_share(
     # risk-free rate that produces this scenario's target WACC, so this still
     # goes through dcf.py's unmodified CAPM formula.
     risk_free_for_scenario = (wacc / 100) - beta * erp_decimal
+
+    growth_y2, growth_y3, growth_y4 = _interpolate_years_2_to_4(growth_y1, growth_y5)
+    margin_y2, margin_y3, margin_y4 = _interpolate_years_2_to_4(margin_y1, margin_y5)
+
     result = run_dcf(
         base_revenue=base_revenue,
-        revenue_growth_y1=growth_y1 / 100, revenue_growth_y2=revenue_growth_y2 / 100,
-        revenue_growth_y3=revenue_growth_y3 / 100, revenue_growth_y4=revenue_growth_y4 / 100,
+        revenue_growth_y1=growth_y1 / 100, revenue_growth_y2=growth_y2 / 100,
+        revenue_growth_y3=growth_y3 / 100, revenue_growth_y4=growth_y4 / 100,
         revenue_growth_y5=growth_y5 / 100,
         revenue_growth_long_term=revenue_growth_long_term / 100,
         terminal_growth_rate=terminal_growth / 100,
-        operating_margin_y1=margin_y1 / 100, operating_margin_y2=operating_margin_y2 / 100,
-        operating_margin_y3=operating_margin_y3 / 100, operating_margin_y4=operating_margin_y4 / 100,
+        operating_margin_y1=margin_y1 / 100, operating_margin_y2=margin_y2 / 100,
+        operating_margin_y3=margin_y3 / 100, operating_margin_y4=margin_y4 / 100,
         operating_margin_y5=margin_y5 / 100,
         tax_rate=tax_rate / 100,
         capex_pct_of_revenue=capex_pct_revenue / 100,
@@ -325,11 +337,12 @@ def run_scenarios(
     cash_and_securities, nonmarketable_securities, total_debt, shares_outstanding,
     current_share_price,
 ):
+    # Note: revenue_growth_y2/y3/y4 and operating_margin_y2/y3/y4 are still
+    # accepted as inputs (so the scenario section still recomputes if those
+    # main-model sliders move) but are no longer used here — each scenario
+    # now interpolates its own Years 2-4 from its own Year 1/Year 5 values.
     shared_kwargs = dict(
-        base_revenue=base_revenue, revenue_growth_y2=revenue_growth_y2, revenue_growth_y3=revenue_growth_y3,
-        revenue_growth_y4=revenue_growth_y4, revenue_growth_long_term=revenue_growth_long_term,
-        operating_margin_y2=operating_margin_y2, operating_margin_y3=operating_margin_y3,
-        operating_margin_y4=operating_margin_y4,
+        base_revenue=base_revenue, revenue_growth_long_term=revenue_growth_long_term,
         tax_rate=tax_rate, capex_pct_revenue=capex_pct_revenue, nwc_pct_revenue=nwc_pct_revenue,
         equity_risk_premium=equity_risk_premium, beta=beta,
         cash_and_securities=cash_and_securities, nonmarketable_securities=nonmarketable_securities,
