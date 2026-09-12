@@ -58,3 +58,74 @@ def portfolio_stats(
     ret = portfolio_return(weights, expected_returns)
     vol = portfolio_volatility(weights, cov_matrix)
     return ret, vol
+
+
+def minimize_variance_for_target_return(
+    expected_returns: pd.Series,
+    cov_matrix: pd.DataFrame,
+    target_return: float,
+) -> pd.Series | None:
+    """Long-only, fully-invested min-variance portfolio for a given target
+    return. Returns None if no feasible portfolio hits that target.
+    """
+    assets = list(expected_returns.index)
+    n = len(assets)
+    mu = expected_returns.values
+    cov = cov_matrix.loc[assets, assets].values
+
+    def variance(w: np.ndarray) -> float:
+        return float(w @ cov @ w)
+
+    constraints = (
+        {"type": "eq", "fun": lambda w: np.sum(w) - 1.0},
+        {"type": "eq", "fun": lambda w: np.dot(w, mu) - target_return},
+    )
+    bounds = tuple((0.0, 1.0) for _ in range(n))
+    initial_guess = np.full(n, 1.0 / n)
+
+    result = minimize(
+        variance,
+        initial_guess,
+        method="SLSQP",
+        bounds=bounds,
+        constraints=constraints,
+        options={"maxiter": 1000, "ftol": 1e-12},
+    )
+
+    if not result.success:
+        return None
+
+    weights = np.clip(result.x, 0.0, None)
+    total = weights.sum()
+    if total <= 0:
+        return None
+    return pd.Series(weights / total, index=assets)
+
+
+def efficient_frontier(
+    expected_returns: pd.Series,
+    cov_matrix: pd.DataFrame,
+    num_points: int = 25,
+) -> pd.DataFrame:
+    """Long-only efficient frontier as (volatility, return) points.
+
+    With no short selling, achievable portfolio returns are bounded by the
+    lowest- and highest-returning individual asset, so the target grid
+    spans that range.
+    """
+    mu = expected_returns.values
+    low, high = float(mu.min()), float(mu.max())
+    targets = np.linspace(low, high, num_points)
+
+    rows = []
+    for target in targets:
+        weights = minimize_variance_for_target_return(
+            expected_returns, cov_matrix, target
+        )
+        if weights is None:
+            continue
+        ret = portfolio_return(weights, expected_returns)
+        vol = portfolio_volatility(weights, cov_matrix)
+        rows.append({"expected_return": ret, "volatility": vol})
+
+    return pd.DataFrame(rows)

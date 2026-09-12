@@ -8,11 +8,11 @@ from portfolio_engine.lifecycle import (
 )
 
 
-def test_equity_pct_matches_100_minus_age_for_moderate_mid_horizon():
+def test_equity_pct_matches_110_minus_age_for_moderate_mid_horizon():
     # moderate + 10-20yr horizon has zero adjustment, so this is the pure
-    # "100 minus age" baseline.
+    # "110 minus age" baseline.
     pct = lifecycle_equity_pct(30, RiskTolerance.MODERATE, 15)
-    assert pct == pytest.approx(0.70)
+    assert pct == pytest.approx(0.80)
 
 
 def test_conservative_lowers_and_aggressive_raises_equity():

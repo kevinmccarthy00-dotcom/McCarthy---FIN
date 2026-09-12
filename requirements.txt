@@ -3,4 +3,5 @@ numpy
 pandas
 scipy
 yfinance
+matplotlib
 pytest

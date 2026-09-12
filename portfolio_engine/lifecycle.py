@@ -42,8 +42,8 @@ def _horizon_adjustment(horizon_years: float) -> float:
 def lifecycle_equity_pct(
     age: int, risk_tolerance: RiskTolerance, horizon_years: float
 ) -> float:
-    """"100 minus age" baseline, nudged by risk tolerance and horizon, clamped."""
-    base = (100 - age) / 100
+    """"110 minus age" baseline, nudged by risk tolerance and horizon, clamped."""
+    base = (110 - age) / 100
     adjusted = (
         base
         + _RISK_TOLERANCE_ADJUSTMENT[RiskTolerance(risk_tolerance)]

@@ -13,7 +13,7 @@ from portfolio_engine.assets import ASSET_CLASSES, TICKER_BY_KEY
 from portfolio_engine.data import MarketData, get_market_data
 from portfolio_engine.lifecycle import RiskTolerance, lifecycle_allocation
 from portfolio_engine.metrics import portfolio_return, portfolio_volatility, sharpe_ratio
-from portfolio_engine.optimizer import mean_variance_optimize
+from portfolio_engine.optimizer import efficient_frontier, mean_variance_optimize
 
 DEFAULT_RISK_FREE_RATE = 0.02
 
@@ -75,7 +75,7 @@ def build_lifecycle_portfolio(
     risk_free_rate: float = DEFAULT_RISK_FREE_RATE,
     market_data: MarketData | None = None,
 ) -> PortfolioResult:
-    """Age-based ("100 minus age") heuristic allocation."""
+    """Age-based ("110 minus age") heuristic allocation."""
     weights = lifecycle_allocation(age, risk_tolerance, horizon_years)
     market_data = market_data or get_market_data()
     inputs = {
@@ -98,6 +98,16 @@ def build_mvo_portfolio(
     )
     inputs = {"risk_free_rate": risk_free_rate}
     return _summarize("mean_variance", weights, market_data, risk_free_rate, inputs)
+
+
+def compute_efficient_frontier(
+    market_data: MarketData | None = None, num_points: int = 25
+) -> pd.DataFrame:
+    """Long-only efficient frontier for the baseline asset universe."""
+    market_data = market_data or get_market_data()
+    return efficient_frontier(
+        market_data.expected_returns, market_data.cov_matrix, num_points
+    )
 
 
 def asset_universe() -> list[dict]:
