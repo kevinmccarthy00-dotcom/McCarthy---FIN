@@ -6,7 +6,9 @@ import pytest
 from portfolio_engine.assets import ASSET_KEYS, EQUITY_KEYS
 from portfolio_engine.lifecycle import RiskTolerance
 from portfolio_engine.research import (
+    duarte_age_anchor,
     human_capital,
+    human_capital_adjustment,
     merton_equity_share,
     research_equity_pct,
     research_informed_allocation,
@@ -47,6 +49,48 @@ def test_full_worked_example_equity_share():
     H = human_capital(55, 100_000, 7, 0.02, 0.02)
     equity_share = min(max(alpha_star * (1 + H / 1_000_000), 0.0), 1.0)
     assert equity_share == pytest.approx(0.30, abs=0.01)
+
+
+def test_duarte_age_anchor_matches_papers_reported_figures():
+    # Duarte, Fonseca, Goodman & Parker (2021), Section 4 / footnote 2:
+    # below 30% at 25, peak of 80% at 45, "declines linearly to about 60%
+    # at retirement" (66), "roughly constant" thereafter.
+    assert duarte_age_anchor(25) == pytest.approx(0.25)
+    assert duarte_age_anchor(45) == pytest.approx(0.80)
+    assert duarte_age_anchor(66) == pytest.approx(0.60)
+    assert duarte_age_anchor(100) == pytest.approx(0.60)
+    assert duarte_age_anchor(90) == pytest.approx(0.60)  # flat after retirement
+
+
+def test_duarte_age_anchor_is_hump_shaped():
+    ages = [25, 35, 45, 55, 66, 80]
+    shares = [duarte_age_anchor(a) for a in ages]
+    peak_index = shares.index(max(shares))
+    assert shares[peak_index] == pytest.approx(0.80)
+    assert shares[: peak_index + 1] == sorted(shares[: peak_index + 1])
+    assert shares[peak_index:] == sorted(shares[peak_index:], reverse=True)
+
+
+def test_human_capital_adjustment_is_zero_with_no_human_capital():
+    assert human_capital_adjustment(0.0, 1_000_000) == pytest.approx(0.0)
+
+
+def test_human_capital_adjustment_is_bounded_by_its_cap():
+    from portfolio_engine.research import HUMAN_CAPITAL_ADJUSTMENT_CAP
+
+    huge_ratio_adjustment = human_capital_adjustment(1_000_000_000, 1)
+    assert huge_ratio_adjustment == pytest.approx(HUMAN_CAPITAL_ADJUSTMENT_CAP, rel=1e-6)
+
+
+def test_lower_wealth_at_same_age_and_income_raises_equity_share():
+    # Duarte et al.'s own quartile finding: at a given age, lower-wealth
+    # households hold relatively MORE equity than wealthier ones.
+    from portfolio_engine.data import get_market_data
+
+    market_data = get_market_data()
+    modest_wealth = research_equity_pct(68, 40_000, 500_000, RiskTolerance.MODERATE, market_data)
+    large_wealth = research_equity_pct(68, 40_000, 5_000_000, RiskTolerance.MODERATE, market_data)
+    assert modest_wealth > large_wealth
 
 
 def test_higher_wealth_relative_to_income_lowers_equity_share():

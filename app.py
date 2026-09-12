@@ -372,9 +372,10 @@ with gr.Blocks(title="Robo-Advisor Portfolio Engine") as demo:
         "Baseline allocation engine covering six asset classes via representative "
         "ETFs, with three allocation methods: an age-driven lifecycle heuristic, "
         "a long-only mean-variance optimizer personalized by risk tolerance and "
-        "horizon, and a research-informed method that weighs financial wealth "
-        "against human capital (the present value of expected future income), "
-        "per Choi, Liu & Liu (2025)."
+        "horizon, and a research-informed method anchored to Duarte, Fonseca, "
+        "Goodman & Parker's (2021) published lifecycle equity-share findings, "
+        "adjusted for each client's own human capital (Choi, Liu & Liu, 2025) "
+        "and risk tolerance."
     )
 
     with gr.Row():

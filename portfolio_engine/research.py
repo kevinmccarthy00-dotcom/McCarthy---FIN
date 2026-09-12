@@ -1,34 +1,84 @@
-"""Research-informed allocation: the human-capital-adjusted equity share
-from Choi, Liu & Liu (2025), "Practical Finance: An Approximate Solution to
-Lifecycle Portfolio Choice" ("CLL"), grounded in the lifecycle model of
-Cocco, Gomes & Maenhout (2005) ("CGM") and the closely related simple rule
-of Duarte, Fonseca, Goodman & Parker (2021) ("DFGP"). Choi (2022) surveys
-popular financial advice (e.g. "100 minus age") and shows it diverges from
-what this literature actually recommends, which is the motivation for
-building this method instead of another hand-tuned age curve.
+"""Research-informed allocation: a practical implementation of the
+human-capital view of lifecycle investing from Duarte, Fonseca, Goodman &
+Parker (2021) ("DFGP"), Choi, Liu & Liu (2025) ("CLL"), and the underlying
+Cocco, Gomes & Maenhout (2005) ("CGM") optimal-control model, motivated by
+Choi (2022)'s finding that popular heuristics like "100 minus age" diverge
+from what this literature actually recommends.
 
-The core idea (Merton, 1969; Bodie, Merton & Samuelson, 1992; CGM; DFGP;
-CLL): a client's risk capacity comes from total wealth - financial wealth
-W plus human capital H, the present value of expected future income. The
-equity share of financial wealth should be
+WHY THIS IS AN "IMPLEMENTATION OF THE INSIGHT," NOT A LITERAL FORMULA
+-----------------------------------------------------------------------
+CLL's own contribution is a simple closed-form approximation,
+alpha = clip(0, 1, alpha_star * (1 + H/W)) (their eq. 9), fit by
+regression to CGM's full numerical solution. It is validated against
+CGM's numerical model - but CLL fit and tested it only at conservative,
+below-historical equity premia (2-4% log) specifically as a stress test
+of the approximation's robustness, and DFGP's own richer numerical model
+(deep reinforcement learning, not a regression fit) shows the plain
+formula overshoots for the young - DFGP attribute the young's low actual
+equity share (under 30% at 25, despite enormous human capital) to
+liquidity constraints and borrowing limits the simple formula doesn't
+capture, not to low human capital. In other words: CLL's formula is a
+faithful map of CGM's solution *inside* CGM's own parameterization, but
+naively plugging in a household's numbers under a different (here, more
+conservative) capital-market assumption set can push the formula's H/W
+term into territory the two papers don't actually claim it handles well.
 
-    alpha = clip(0, 1, alpha_star * (1 + H / W))
+So instead of transcribing alpha_star * (1 + H/W) as the final answer,
+this module uses DFGP's own *reported* age-conditional equity shares -
+their real, published numbers - as the anchor, and uses the human-capital
+machinery (still CLL's discount-rate approximation, unchanged) only as a
+bounded adjustment on top: how much a given client's own pension-like
+income and wealth should move them above or below that empirical anchor,
+not to replace it outright. Risk tolerance is applied once, as a bounded
+personal-preference tilt (Choi 2022's "willingness to take risk"),
+because it is one of the app's collected inputs and DFGP's model has no
+free preference parameter beyond risk aversion (which we hold fixed for
+computing H - see below).
 
-where alpha_star is the Merton (1969) optimal equity share for an investor
-with NO labor income (equation 8 in CLL):
+1. AGE ANCHOR (Duarte et al., 2021, Section 4 and its footnote 2):
+   "the share of financial wealth that a household should hold in stocks
+   is hump-shaped over the working life, peaking around age 45 at 80%
+   and declining to a stable 60% at and during retirement" and "the
+   average optimal share in equity declines linearly to about 60% at
+   retirement, after which it is roughly constant." Those four numbers
+   (25% at the start of working life [DFGP: "below 30%"], 80% at 45,
+   60% at the retirement threshold, 60% flat thereafter) are DFGP's own
+   reported figures, not fit by us; DUARTE_ANCHOR_AGES/_SHARES below is a
+   piecewise-linear read of that description (linear between 45 and 66,
+   per DFGP's own word "linearly"), not a numerical solution we re-ran.
 
-    alpha_star = clip(0, 1, (log_equity_premium + 0.5 * sigma_S^2)
-                              / (risk_aversion * sigma_S^2))
+2. HUMAN-CAPITAL ADJUSTMENT (bounded, not multiplicative): human_capital()
+   below is unchanged CLL machinery - the same regression-based discount
+   rates (their Tables 1-2), validated against their own worked example
+   to the dollar (see tests/test_research.py). Rather than feeding H
+   straight into an unbounded alpha*(1+H/W), we use it as a capped nudge,
+   HUMAN_CAPITAL_ADJUSTMENT_CAP * tanh(H/W), around the DFGP anchor. Two
+   reasons for a bounded, saturating shape instead of the raw ratio:
+   (a) DFGP's own cross-sectional finding is that WEALTHIER households
+   hold a MORE steeply declining, LOWER late-life equity share than
+   poorer ones at the same age (their Section 4.2 / Figure VI.a: "23
+   percentage points more [equity]... 26 percentage points less" between
+   the top and bottom total-financial-wealth quartiles at age 65) - i.e.
+   more relative pension/human-capital coverage (equivalently, lower
+   wealth for a given income) pushes equity UP, consistent in direction
+   with H/W, giving us a real, cited empirical magnitude to calibrate
+   against; (b) an unbounded H/W blows past what DFGP's own frictioned
+   model would recommend for extreme cases (very young, or very wealthy
+   relative to income) - exactly the liquidity-constraint gap noted
+   above. The cap is set to 12 percentage points, roughly half of DFGP's
+   ~23-26 point top-vs-bottom-quartile spread, since we are nudging a
+   single client away from one anchor rather than differentiating four
+   quartiles; this specific number is our own calibration choice, not a
+   figure printed in either paper, and is documented here rather than
+   left implicit.
 
-CLL's contribution is a practical, regression-based approximation for the
-discount rate used to compute H under CGM's realistic lifecycle model
-(risky, non-tradable labor income; no borrowing/short-selling), fit across
-5,103 numerically-solved parameter combinations. Their approximation
-matches the true CGM solution with R^2 = 0.99 and an average welfare loss
-of only 0.06% of consumption, versus 2.00% for "100 minus age" and 3.75%
-for a constant 60% equity share (CLL Table/Section 4) - i.e. it is not a
-hand-tuned curve but a validated approximation to a real optimal-control
-solution.
+3. RISK-TOLERANCE TILT: a fixed +/-7.5 percentage point shift for
+   aggressive/conservative clients (moderate: no shift), smaller than the
+   age and human-capital effects since those are the ones DFGP and CLL
+   actually document; risk aversion itself is held fixed at CLL's tested
+   midpoint (gamma=7) when computing H, so a client's stated risk
+   tolerance affects the result exactly once, not doubled through both
+   the discount-rate calculation and this tilt.
 
 Deliberate simplifications versus the papers (documented, not hidden):
 - CGM/CLL fit a cubic, education-specific deterministic age-earnings
@@ -45,7 +95,12 @@ Deliberate simplifications versus the papers (documented, not hidden):
   baseline calibration rather than collected from the client, since this
   app does not ask about education or expected retirement benefits.
 - Retirement age is fixed at CGM/CLL's 66 (benefits begin at 67, the
-  current Social Security full retirement age).
+  current Social Security full retirement age) - but per the anchor
+  above, a retiree's equity share does NOT keep declining after this
+  point the way the baseline lifecycle heuristic's age rule does; it
+  holds near 60%, exactly DFGP's point that retirees still draw a
+  long-horizon, pension-like income stream that keeps supporting risk-
+  taking rather than a naive "years until you need the money" framing.
 - The "risk-free asset" and "the stock market" in CLL's binary risky/safe
   framing are proxied here by this engine's existing fixed-income sleeve
   (US bonds + TIPS) and equity sleeve (US/international/EM stocks +
@@ -55,15 +110,15 @@ Deliberate simplifications versus the papers (documented, not hidden):
   splitting each sleeve into the app's six asset classes is this app's
   own extension, not something the papers specify.
 - This method's equity share depends on age, income, wealth, and risk
-  tolerance (via risk aversion) - per CLL, NOT on the app's generic
-  "investment horizon" slider, which represents a goal timeline (e.g.
-  saving for a house in 5 years) rather than years-to-retirement. Horizon
-  is intentionally not an input here, unlike the baseline lifecycle
-  heuristic.
+  tolerance, NOT on the app's generic "investment horizon" slider, which
+  represents a goal timeline (e.g. saving for a house in 5 years) rather
+  than years-to-retirement. Horizon is intentionally not an input here,
+  unlike the baseline lifecycle heuristic.
 """
 
 import math
 
+import numpy as np
 import pandas as pd
 
 from portfolio_engine.assets import (
@@ -86,13 +141,35 @@ RETIREMENT_REPLACEMENT_RATE = 0.40  # CLL's baseline example / lowest tested val
 SIGMA_PERMANENT_INCOME_SHOCK = 0.130
 SIGMA_TRANSITORY_INCOME_SHOCK = 0.242
 
-# Relative risk aversion by risk tolerance, drawn from CLL's own tested
-# range (4 to 10, with 10 "commonly regarded as the upper limit of
-# reasonable risk aversion").
-RISK_AVERSION_BY_TOLERANCE: dict[RiskTolerance, float] = {
-    RiskTolerance.CONSERVATIVE: 9.0,
-    RiskTolerance.MODERATE: 7.0,
-    RiskTolerance.AGGRESSIVE: 4.0,
+# Risk aversion held fixed at CLL's tested midpoint (their range is 4-10)
+# when computing human capital, so a client's risk tolerance affects the
+# result exactly once - via RISK_TOLERANCE_TILT below - not twice.
+REFERENCE_RISK_AVERSION = 7.0
+
+# Duarte, Fonseca, Goodman & Parker (2021), Section 4 and footnote 2: the
+# equity share of financial wealth starts below 30% at the beginning of
+# working life (age 25), rises to a peak of 80% around age 45, "declines
+# linearly to about 60% at retirement" (age 66), "after which it is
+# roughly constant." These four points are DFGP's own reported figures.
+DUARTE_ANCHOR_AGES = [25, 45, LAST_WORKING_AGE, MAX_AGE]
+DUARTE_ANCHOR_SHARES = [0.25, 0.80, 0.60, 0.60]
+
+# Cap on the human-capital adjustment applied around the Duarte anchor:
+# roughly half of DFGP's own reported ~23-26 percentage point spread
+# between the top and bottom total-financial-wealth quartiles at a given
+# age (Section 4.2 / Figure VI.a) - halved because we are nudging one
+# client away from a single anchor, not differentiating four quartiles.
+# This specific number is our own calibration choice (documented, not a
+# figure printed in either paper).
+HUMAN_CAPITAL_ADJUSTMENT_CAP = 0.12
+
+# Bounded personal-preference tilt (Choi 2022's "willingness to take
+# risk"), smaller than the age/human-capital effects since those are the
+# ones DFGP and CLL actually document.
+RISK_TOLERANCE_TILT: dict[RiskTolerance, float] = {
+    RiskTolerance.CONSERVATIVE: -0.075,
+    RiskTolerance.MODERATE: 0.0,
+    RiskTolerance.AGGRESSIVE: 0.075,
 }
 
 # CLL Table 1, column 3: one-year-ahead discount rate for labor income
@@ -240,6 +317,22 @@ def merton_equity_share(
     return min(max(raw, 0.0), 1.0)
 
 
+def duarte_age_anchor(age: float) -> float:
+    """DFGP (2021)'s own reported age-conditional equity share (see module
+    docstring): a piecewise-linear read of their described curve, clamped
+    to their studied working-life start age of 25 at the low end."""
+    clamped_age = min(max(age, DUARTE_ANCHOR_AGES[0]), DUARTE_ANCHOR_AGES[-1])
+    return float(np.interp(clamped_age, DUARTE_ANCHOR_AGES, DUARTE_ANCHOR_SHARES))
+
+
+def human_capital_adjustment(human_capital_value: float, wealth: float) -> float:
+    """Bounded nudge around the Duarte anchor from a client's own
+    human-capital-to-wealth ratio (see module docstring for the
+    calibration of the cap and the choice of a saturating tanh shape)."""
+    ratio = human_capital_value / max(wealth, 1e-9)
+    return HUMAN_CAPITAL_ADJUSTMENT_CAP * math.tanh(ratio)
+
+
 def research_equity_pct(
     age: int,
     annual_income: float,
@@ -247,23 +340,26 @@ def research_equity_pct(
     risk_tolerance: RiskTolerance,
     market_data: MarketData,
 ) -> float:
-    """The CLL human-capital-adjusted equity share for one client."""
-    risk_aversion = RISK_AVERSION_BY_TOLERANCE[RiskTolerance(risk_tolerance)]
-
+    """The equity share for one client: Duarte et al.'s (2021) own
+    reported age-conditional share, adjusted for this client's human
+    capital (via CLL's discount-rate approximation) and risk tolerance."""
     equity_return, equity_vol = _sleeve_arithmetic_stats(market_data, EQUITY_SLEEVE_SPLIT)
     fixed_income_return, _ = _sleeve_arithmetic_stats(market_data, FIXED_INCOME_SLEEVE_SPLIT)
 
     log_equity_mean, log_equity_var = _log_return_params(equity_return, equity_vol)
     log_risk_free = math.log(1 + fixed_income_return)
     log_equity_premium = log_equity_mean - log_risk_free
-    sigma_log_equity = math.sqrt(log_equity_var)
-
-    alpha_star = merton_equity_share(risk_aversion, log_equity_premium, sigma_log_equity)
 
     wealth = max(initial_investment, 1e-9)
-    H = human_capital(age, annual_income, risk_aversion, log_equity_premium, log_risk_free)
+    H = human_capital(
+        age, annual_income, REFERENCE_RISK_AVERSION, log_equity_premium, log_risk_free
+    )
 
-    return min(max(alpha_star * (1 + H / wealth), 0.0), 1.0)
+    anchor = duarte_age_anchor(age)
+    adjustment = human_capital_adjustment(H, wealth)
+    tilt = RISK_TOLERANCE_TILT[RiskTolerance(risk_tolerance)]
+
+    return min(max(anchor + adjustment + tilt, 0.0), 1.0)
 
 
 def research_informed_allocation(
