@@ -1,7 +1,5 @@
-gradio
-numpy
-pandas
-scipy
-yfinance
-matplotlib
-pytest
+numpy==2.4.6
+pandas==3.0.5
+scipy==1.17.1
+yfinance==1.7.0
+matplotlib==3.11.2
