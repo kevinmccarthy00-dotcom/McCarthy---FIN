@@ -1,69 +1,118 @@
+import math
+
+import pandas as pd
 import pytest
 
 from portfolio_engine.assets import ASSET_KEYS, EQUITY_KEYS
 from portfolio_engine.lifecycle import RiskTolerance
-from portfolio_engine.research import research_equity_pct, research_informed_allocation
+from portfolio_engine.research import (
+    human_capital,
+    merton_equity_share,
+    research_equity_pct,
+    research_informed_allocation,
+)
 
 
-def test_equity_pct_is_hump_shaped_with_age():
-    ages = [18, 25, 35, 45, 55, 65, 75, 80]
-    pcts = [
-        research_equity_pct(age, RiskTolerance.MODERATE, 20, 100_000, 0) for age in ages
-    ]
-    peak_index = pcts.index(max(pcts))
-    # peak should be somewhere in the middle of the age range, not at either end
-    assert 1 <= peak_index <= len(ages) - 2
-    # rising into the peak
-    assert pcts[:peak_index + 1] == sorted(pcts[:peak_index + 1])
-    # falling after the peak
-    assert pcts[peak_index:] == sorted(pcts[peak_index:], reverse=True)
+def test_human_capital_matches_paper_worked_example():
+    # Choi, Liu & Liu (2025) Section 3.3: age 55, risk aversion 7, log
+    # risk-free rate 2%, log equity premium 2%, replacement rate 40%,
+    # college-graduate income risk, $100,000 income through age 66 then a
+    # (lambda-implied) $40,000 retirement benefit. The paper reports
+    # H = $924,805 and a resulting equity share of 30% (vs. their exact
+    # optimum of 33%, since this is a fitted approximation, not an exact
+    # formula - reproducing their number validates our transcription of
+    # their regression coefficients).
+    H = human_capital(
+        age=55,
+        annual_income=100_000,
+        risk_aversion=7,
+        log_equity_premium=0.02,
+        log_risk_free=0.02,
+    )
+    assert H == pytest.approx(924_805, rel=1e-3)
 
 
-def test_higher_wealth_increases_equity_allocation_all_else_equal():
-    low_wealth = research_equity_pct(50, RiskTolerance.MODERATE, 20, 20_000, 0)
-    high_wealth = research_equity_pct(50, RiskTolerance.MODERATE, 20, 2_000_000, 0)
-    assert high_wealth > low_wealth
+def test_merton_share_matches_paper_worked_example():
+    # Same scenario: alpha* = 15.5% per the paper.
+    alpha_star = merton_equity_share(
+        risk_aversion=7, log_equity_premium=0.02, sigma_log_equity=0.185
+    )
+    assert alpha_star == pytest.approx(0.155, abs=1e-3)
 
 
-def test_stronger_contribution_increases_equity_allocation_all_else_equal():
-    low_contribution = research_equity_pct(40, RiskTolerance.MODERATE, 20, 100_000, 50)
-    high_contribution = research_equity_pct(40, RiskTolerance.MODERATE, 20, 100_000, 2_000)
-    assert high_contribution > low_contribution
+def test_full_worked_example_equity_share():
+    # alpha* * (1 + H/W) with W = $1,000,000 should land at ~30%, matching
+    # the paper (their true numerical optimum for this case is 33%).
+    alpha_star = merton_equity_share(7, 0.02, 0.185)
+    H = human_capital(55, 100_000, 7, 0.02, 0.02)
+    equity_share = min(max(alpha_star * (1 + H / 1_000_000), 0.0), 1.0)
+    assert equity_share == pytest.approx(0.30, abs=0.01)
 
 
-def test_zero_contribution_is_not_penalized_like_a_low_contribution():
-    zero_contribution = research_equity_pct(68, RiskTolerance.MODERATE, 20, 1_500_000, 0)
-    tiny_contribution = research_equity_pct(68, RiskTolerance.MODERATE, 20, 1_500_000, 50)
-    assert zero_contribution >= tiny_contribution
+def test_higher_wealth_relative_to_income_lowers_equity_share():
+    from portfolio_engine.data import get_market_data
+
+    market_data = get_market_data()
+    low_wealth = research_equity_pct(45, 100_000, 50_000, RiskTolerance.MODERATE, market_data)
+    high_wealth = research_equity_pct(45, 100_000, 5_000_000, RiskTolerance.MODERATE, market_data)
+    assert low_wealth > high_wealth
+
+
+def test_higher_income_relative_to_wealth_raises_equity_share():
+    from portfolio_engine.data import get_market_data
+
+    market_data = get_market_data()
+    low_income = research_equity_pct(45, 20_000, 500_000, RiskTolerance.MODERATE, market_data)
+    high_income = research_equity_pct(45, 300_000, 500_000, RiskTolerance.MODERATE, market_data)
+    assert high_income > low_income
+
+
+def test_higher_risk_aversion_lowers_equity_share():
+    from portfolio_engine.data import get_market_data
+
+    market_data = get_market_data()
+    conservative = research_equity_pct(45, 100_000, 500_000, RiskTolerance.CONSERVATIVE, market_data)
+    aggressive = research_equity_pct(45, 100_000, 500_000, RiskTolerance.AGGRESSIVE, market_data)
+    assert aggressive > conservative
+
+
+def test_equity_share_bounded_between_zero_and_one():
+    from portfolio_engine.data import get_market_data
+
+    market_data = get_market_data()
+    tiny_wealth_share = research_equity_pct(25, 200_000, 100, RiskTolerance.AGGRESSIVE, market_data)
+    huge_wealth_share = research_equity_pct(80, 20_000, 50_000_000, RiskTolerance.CONSERVATIVE, market_data)
+    assert 0.0 <= tiny_wealth_share <= 1.0
+    assert 0.0 <= huge_wealth_share <= 1.0
+
+
+def test_retiree_human_capital_declines_with_age():
+    # Holding the (already-retired) benefit level fixed, human capital
+    # should fall as fewer years of remaining benefit payments are left.
+    H_70 = human_capital(70, 50_000, 7, 0.02, 0.02)
+    H_90 = human_capital(90, 50_000, 7, 0.02, 0.02)
+    assert H_70 > H_90 > 0
 
 
 def test_allocation_weights_sum_to_one_and_are_non_negative():
-    weights = research_informed_allocation(45, RiskTolerance.AGGRESSIVE, 20, 500_000, 1_000)
+    from portfolio_engine.data import get_market_data
+
+    market_data = get_market_data()
+    weights = research_informed_allocation(45, 150_000, 500_000, RiskTolerance.AGGRESSIVE, market_data)
     assert set(weights.index) == set(ASSET_KEYS)
     assert weights.sum() == pytest.approx(1.0)
     assert (weights >= 0).all()
 
 
 def test_invalid_inputs_raise():
-    with pytest.raises(ValueError):
-        research_informed_allocation(-1)
-    with pytest.raises(ValueError):
-        research_informed_allocation(150)
-    with pytest.raises(ValueError):
-        research_informed_allocation(40, initial_investment=-1)
-    with pytest.raises(ValueError):
-        research_informed_allocation(40, monthly_contribution=-1)
+    from portfolio_engine.data import get_market_data
 
-
-def test_client_a_profile_lands_high_equity():
-    # Age 35, moderate, 30yr horizon, $100,000 initial, $2,000/mo, retirement
-    weights = research_informed_allocation(35, RiskTolerance.MODERATE, 30, 100_000, 2_000)
-    equity_pct = weights[EQUITY_KEYS].sum()
-    assert equity_pct > 0.75  # young, long horizon, strong savings rate
-
-
-def test_client_b_profile_lands_in_55_to_65_percent_equity():
-    # Age 68, moderate, 20yr horizon, $1,500,000 initial, $0/mo, retirement
-    weights = research_informed_allocation(68, RiskTolerance.MODERATE, 20, 1_500_000, 0)
-    equity_pct = weights[EQUITY_KEYS].sum()
-    assert 0.55 <= equity_pct <= 0.65
+    market_data = get_market_data()
+    with pytest.raises(ValueError):
+        research_informed_allocation(10, 50_000, 100_000, RiskTolerance.MODERATE, market_data)
+    with pytest.raises(ValueError):
+        research_informed_allocation(150, 50_000, 100_000, RiskTolerance.MODERATE, market_data)
+    with pytest.raises(ValueError):
+        research_informed_allocation(40, -1, 100_000, RiskTolerance.MODERATE, market_data)
+    with pytest.raises(ValueError):
+        research_informed_allocation(40, 50_000, -1, RiskTolerance.MODERATE, market_data)

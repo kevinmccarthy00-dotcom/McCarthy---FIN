@@ -26,7 +26,7 @@ ASSET_TICKER_BY_KEY = {a.key: a.ticker for a in ASSET_CLASSES}
 
 METHOD_LIFECYCLE = "Lifecycle / Heuristic"
 METHOD_MVO = "Mean-Variance Optimization"
-METHOD_RESEARCH = "Research-Informed (Hump-Shaped Glide Path)"
+METHOD_RESEARCH = "Research-Informed (Human Capital)"
 METHOD_COLORS = {
     METHOD_LIFECYCLE: "tab:blue",
     METHOD_MVO: "tab:red",
@@ -39,6 +39,7 @@ AGE_MIN, AGE_MAX = 18, 80
 HORIZON_MIN, HORIZON_MAX = 1, 30
 INITIAL_MIN, INITIAL_MAX = 1_000, 10_000_000
 CONTRIBUTION_MIN, CONTRIBUTION_MAX = 0, 50_000
+INCOME_MIN, INCOME_MAX = 0, 5_000_000
 
 # Fetched once at startup rather than on every click - avoids hammering
 # yfinance (or retrying a dead connection) on each button press. Restart
@@ -46,7 +47,7 @@ CONTRIBUTION_MIN, CONTRIBUTION_MAX = 0, 50_000
 MARKET_DATA = get_market_data()
 
 
-def _validate_inputs(age, horizon_years, initial_investment, monthly_contribution):
+def _validate_inputs(age, horizon_years, initial_investment, monthly_contribution, annual_income):
     if age is None or not (AGE_MIN <= age <= AGE_MAX):
         raise gr.Error(f"Age must be between {AGE_MIN} and {AGE_MAX}.")
     if horizon_years is None or not (HORIZON_MIN <= horizon_years <= HORIZON_MAX):
@@ -62,6 +63,10 @@ def _validate_inputs(age, horizon_years, initial_investment, monthly_contributio
     ):
         raise gr.Error(
             f"Monthly contribution must be between ${CONTRIBUTION_MIN:,} and ${CONTRIBUTION_MAX:,}."
+        )
+    if annual_income is None or not (INCOME_MIN <= annual_income <= INCOME_MAX):
+        raise gr.Error(
+            f"Annual income must be between ${INCOME_MIN:,} and ${INCOME_MAX:,}."
         )
 
 
@@ -292,6 +297,7 @@ def generate_portfolio(
     horizon_years,
     initial_investment,
     monthly_contribution,
+    annual_income,
     financial_goal,
     method_label,
 ):
@@ -299,7 +305,7 @@ def generate_portfolio(
 
     age = int(age)
     horizon_years = int(horizon_years)
-    _validate_inputs(age, horizon_years, initial_investment, monthly_contribution)
+    _validate_inputs(age, horizon_years, initial_investment, monthly_contribution, annual_income)
 
     risk_tolerance = RiskTolerance(risk_tolerance_label.lower())
     market_data = MARKET_DATA
@@ -317,10 +323,9 @@ def generate_portfolio(
     )
     research_result = build_research_informed_portfolio(
         age=age,
-        risk_tolerance=risk_tolerance,
-        horizon_years=horizon_years,
+        annual_income=annual_income,
         initial_investment=initial_investment,
-        monthly_contribution=monthly_contribution,
+        risk_tolerance=risk_tolerance,
         market_data=market_data,
     )
 
@@ -367,8 +372,9 @@ with gr.Blocks(title="Robo-Advisor Portfolio Engine") as demo:
         "Baseline allocation engine covering six asset classes via representative "
         "ETFs, with three allocation methods: an age-driven lifecycle heuristic, "
         "a long-only mean-variance optimizer personalized by risk tolerance and "
-        "horizon, and a research-informed method with a hump-shaped glide path "
-        "that also considers wealth and ongoing savings capacity."
+        "horizon, and a research-informed method that weighs financial wealth "
+        "against human capital (the present value of expected future income), "
+        "per Choi, Liu & Liu (2025)."
     )
 
     with gr.Row():
@@ -394,6 +400,14 @@ with gr.Blocks(title="Robo-Advisor Portfolio Engine") as demo:
                 maximum=CONTRIBUTION_MAX,
                 step=50,
                 label="Monthly Contribution ($)",
+            )
+            annual_income = gr.Number(
+                value=80_000,
+                minimum=INCOME_MIN,
+                maximum=INCOME_MAX,
+                step=5_000,
+                label="Annual Income ($)",
+                info="Current salary if working, or current retirement income if retired. Used only by the Research-Informed method.",
             )
             financial_goal = gr.Dropdown(
                 GOAL_OPTIONS, value="Retirement", label="Financial Goal"
@@ -432,6 +446,7 @@ with gr.Blocks(title="Robo-Advisor Portfolio Engine") as demo:
         horizon_years,
         initial_investment,
         monthly_contribution,
+        annual_income,
         financial_goal,
         method,
     ]
