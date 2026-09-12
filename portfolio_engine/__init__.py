@@ -5,6 +5,7 @@ from portfolio_engine.engine import (
     asset_universe,
     build_lifecycle_portfolio,
     build_mvo_portfolio,
+    build_research_informed_portfolio,
     compute_efficient_frontier,
 )
 from portfolio_engine.lifecycle import RiskTolerance
@@ -18,6 +19,7 @@ __all__ = [
     "asset_universe",
     "build_lifecycle_portfolio",
     "build_mvo_portfolio",
+    "build_research_informed_portfolio",
     "compute_efficient_frontier",
     "get_market_data",
     "project_wealth_path",

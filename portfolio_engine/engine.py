@@ -14,6 +14,7 @@ from portfolio_engine.data import MarketData, get_market_data
 from portfolio_engine.lifecycle import RiskTolerance, lifecycle_allocation
 from portfolio_engine.metrics import portfolio_return, portfolio_volatility, sharpe_ratio
 from portfolio_engine.optimizer import efficient_frontier, maximize_utility
+from portfolio_engine.research import research_informed_allocation
 from portfolio_engine.risk_profile import risk_aversion_for_profile
 
 DEFAULT_RISK_FREE_RATE = 0.02
@@ -116,6 +117,36 @@ def build_mvo_portfolio(
         "risk_free_rate": risk_free_rate,
     }
     return _summarize("mean_variance", weights, market_data, risk_free_rate, inputs)
+
+
+def build_research_informed_portfolio(
+    age: int,
+    risk_tolerance: RiskTolerance = RiskTolerance.MODERATE,
+    horizon_years: float = 20,
+    initial_investment: float = 10_000,
+    monthly_contribution: float = 0,
+    risk_free_rate: float = DEFAULT_RISK_FREE_RATE,
+    market_data: MarketData | None = None,
+) -> PortfolioResult:
+    """Hump-shaped, wealth/income-aware research-informed heuristic.
+
+    Unlike the lifecycle heuristic (age, risk tolerance, horizon only), this
+    considers the client's wealth and ongoing savings capacity too - see
+    research.py for the glide-path and tilt rationale.
+    """
+    weights = research_informed_allocation(
+        age, risk_tolerance, horizon_years, initial_investment, monthly_contribution
+    )
+    market_data = market_data or get_market_data()
+    inputs = {
+        "age": age,
+        "risk_tolerance": RiskTolerance(risk_tolerance).value,
+        "horizon_years": horizon_years,
+        "initial_investment": initial_investment,
+        "monthly_contribution": monthly_contribution,
+        "risk_free_rate": risk_free_rate,
+    }
+    return _summarize("research_informed", weights, market_data, risk_free_rate, inputs)
 
 
 def compute_efficient_frontier(

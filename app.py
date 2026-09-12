@@ -15,6 +15,7 @@ from portfolio_engine import (
     RiskTolerance,
     build_lifecycle_portfolio,
     build_mvo_portfolio,
+    build_research_informed_portfolio,
     compute_efficient_frontier,
     get_market_data,
     wealth_scenarios,
@@ -25,6 +26,12 @@ ASSET_TICKER_BY_KEY = {a.key: a.ticker for a in ASSET_CLASSES}
 
 METHOD_LIFECYCLE = "Lifecycle / Heuristic"
 METHOD_MVO = "Mean-Variance Optimization"
+METHOD_RESEARCH = "Research-Informed (Hump-Shaped Glide Path)"
+METHOD_COLORS = {
+    METHOD_LIFECYCLE: "tab:blue",
+    METHOD_MVO: "tab:red",
+    METHOD_RESEARCH: "tab:green",
+}
 RISK_TOLERANCE_OPTIONS = ["Conservative", "Moderate", "Aggressive"]
 GOAL_OPTIONS = ["Retirement", "Home Purchase", "Education", "General Wealth"]
 
@@ -89,23 +96,22 @@ def _allocation_dataframe(result):
     return df.sort_values("Weight (%)", ascending=False).reset_index(drop=True)
 
 
-def _comparison_dataframe(lifecycle_result, mvo_result):
-    return pd.DataFrame(
-        [
+def _comparison_dataframe(lifecycle_result, mvo_result, research_result):
+    rows = []
+    for label, result in [
+        (METHOD_LIFECYCLE, lifecycle_result),
+        (METHOD_MVO, mvo_result),
+        (METHOD_RESEARCH, research_result),
+    ]:
+        rows.append(
             {
-                "Method": "Lifecycle / Heuristic",
-                "Expected Return": f"{lifecycle_result.expected_return:.2%}",
-                "Volatility": f"{lifecycle_result.expected_volatility:.2%}",
-                "Sharpe Ratio": f"{lifecycle_result.sharpe_ratio:.2f}",
-            },
-            {
-                "Method": "Mean-Variance Optimization",
-                "Expected Return": f"{mvo_result.expected_return:.2%}",
-                "Volatility": f"{mvo_result.expected_volatility:.2%}",
-                "Sharpe Ratio": f"{mvo_result.sharpe_ratio:.2f}",
-            },
-        ]
-    )
+                "Method": label,
+                "Expected Return": f"{result.expected_return:.2%}",
+                "Volatility": f"{result.expected_volatility:.2%}",
+                "Sharpe Ratio": f"{result.sharpe_ratio:.2f}",
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 def _plot_allocation(result, title):
@@ -120,7 +126,7 @@ def _plot_allocation(result, title):
     return fig
 
 
-def _plot_risk_return(market_data, lifecycle_result, mvo_result):
+def _plot_risk_return(market_data, lifecycle_result, mvo_result, research_result):
     fig, ax = plt.subplots(figsize=(6, 5))
     vols = np.sqrt(np.diag(market_data.cov_matrix.values))
     rets = market_data.expected_returns.values
@@ -135,24 +141,20 @@ def _plot_risk_return(market_data, lifecycle_result, mvo_result):
             textcoords="offset points",
         )
 
-    ax.scatter(
-        [lifecycle_result.expected_volatility],
-        [lifecycle_result.expected_return],
-        color="tab:blue",
-        marker="*",
-        s=250,
-        label="Lifecycle Portfolio",
-        zorder=3,
-    )
-    ax.scatter(
-        [mvo_result.expected_volatility],
-        [mvo_result.expected_return],
-        color="tab:red",
-        marker="*",
-        s=250,
-        label="Mean-Variance Portfolio",
-        zorder=3,
-    )
+    for label, result in [
+        (METHOD_LIFECYCLE, lifecycle_result),
+        (METHOD_MVO, mvo_result),
+        (METHOD_RESEARCH, research_result),
+    ]:
+        ax.scatter(
+            [result.expected_volatility],
+            [result.expected_return],
+            color=METHOD_COLORS[label],
+            marker="*",
+            s=250,
+            label=label,
+            zorder=3,
+        )
 
     ax.set_xlabel("Volatility (annualized std. dev.)")
     ax.set_ylabel("Expected Annual Return")
@@ -201,20 +203,28 @@ def _plot_wealth(scenarios, goal_label):
     return fig
 
 
-def _plot_comparison(lifecycle_result, mvo_result):
+def _plot_comparison(lifecycle_result, mvo_result, research_result):
     fig, ax = plt.subplots(figsize=(7, 4.5))
     keys = list(lifecycle_result.weights.index)
     labels = [ASSET_NAME_BY_KEY[k] for k in keys]
     x = np.arange(len(keys))
-    width = 0.35
+    width = 0.25
 
-    ax.bar(x - width / 2, lifecycle_result.weights.values * 100, width, label="Lifecycle")
-    ax.bar(
-        x + width / 2,
-        mvo_result.weights.reindex(keys).values * 100,
-        width,
-        label="Mean-Variance",
-    )
+    results = [
+        (METHOD_LIFECYCLE, lifecycle_result),
+        (METHOD_MVO, mvo_result),
+        (METHOD_RESEARCH, research_result),
+    ]
+    offsets = [-width, 0, width]
+    for offset, (label, result) in zip(offsets, results):
+        ax.bar(
+            x + offset,
+            result.weights.reindex(keys).values * 100,
+            width,
+            label=label,
+            color=METHOD_COLORS[label],
+        )
+
     ax.set_xticks(x)
     ax.set_xticklabels(labels, rotation=30, ha="right")
     ax.set_ylabel("Weight (%)")
@@ -224,7 +234,7 @@ def _plot_comparison(lifecycle_result, mvo_result):
     return fig
 
 
-def _plot_frontier(market_data, frontier_df, mvo_result, lifecycle_result):
+def _plot_frontier(market_data, frontier_df, lifecycle_result, mvo_result, research_result):
     fig, ax = plt.subplots(figsize=(6, 5))
     ax.plot(
         frontier_df["volatility"],
@@ -246,24 +256,25 @@ def _plot_frontier(market_data, frontier_df, mvo_result, lifecycle_result):
             textcoords="offset points",
         )
 
-    ax.scatter(
-        [mvo_result.expected_volatility],
-        [mvo_result.expected_return],
-        color="tab:red",
-        marker="*",
-        s=250,
-        label="Optimized Portfolio (your risk profile)",
-        zorder=3,
-    )
-    ax.scatter(
-        [lifecycle_result.expected_volatility],
-        [lifecycle_result.expected_return],
-        color="tab:blue",
-        marker="*",
-        s=250,
-        label="Lifecycle Portfolio",
-        zorder=3,
-    )
+    labels = {
+        METHOD_MVO: "Optimized Portfolio (your risk profile)",
+        METHOD_LIFECYCLE: "Lifecycle Portfolio",
+        METHOD_RESEARCH: "Research-Informed Portfolio",
+    }
+    for method, result in [
+        (METHOD_MVO, mvo_result),
+        (METHOD_LIFECYCLE, lifecycle_result),
+        (METHOD_RESEARCH, research_result),
+    ]:
+        ax.scatter(
+            [result.expected_volatility],
+            [result.expected_return],
+            color=METHOD_COLORS[method],
+            marker="*",
+            s=250,
+            label=labels[method],
+            zorder=3,
+        )
 
     ax.set_xlabel("Volatility (annualized std. dev.)")
     ax.set_ylabel("Expected Annual Return")
@@ -304,9 +315,22 @@ def generate_portfolio(
         horizon_years=horizon_years,
         market_data=market_data,
     )
+    research_result = build_research_informed_portfolio(
+        age=age,
+        risk_tolerance=risk_tolerance,
+        horizon_years=horizon_years,
+        initial_investment=initial_investment,
+        monthly_contribution=monthly_contribution,
+        market_data=market_data,
+    )
 
+    results_by_method = {
+        METHOD_LIFECYCLE: lifecycle_result,
+        METHOD_MVO: mvo_result,
+        METHOD_RESEARCH: research_result,
+    }
+    primary = results_by_method[method_label]
     is_mvo = method_label == METHOD_MVO
-    primary = mvo_result if is_mvo else lifecycle_result
 
     scenarios = wealth_scenarios(
         initial_investment,
@@ -319,17 +343,19 @@ def generate_portfolio(
     frontier_fig = None
     if is_mvo:
         frontier_df = compute_efficient_frontier(market_data=market_data, num_points=20)
-        frontier_fig = _plot_frontier(market_data, frontier_df, mvo_result, lifecycle_result)
+        frontier_fig = _plot_frontier(
+            market_data, frontier_df, lifecycle_result, mvo_result, research_result
+        )
 
     return (
         _metrics_markdown(primary, method_label),
         _data_source_markdown(market_data),
         _allocation_dataframe(primary),
         _plot_allocation(primary, f"{method_label} Allocation"),
-        _plot_risk_return(market_data, lifecycle_result, mvo_result),
+        _plot_risk_return(market_data, lifecycle_result, mvo_result, research_result),
         _plot_wealth(scenarios, financial_goal),
-        _comparison_dataframe(lifecycle_result, mvo_result),
-        _plot_comparison(lifecycle_result, mvo_result),
+        _comparison_dataframe(lifecycle_result, mvo_result, research_result),
+        _plot_comparison(lifecycle_result, mvo_result, research_result),
         gr.update(visible=is_mvo),
         frontier_fig,
     )
@@ -339,9 +365,10 @@ with gr.Blocks(title="Robo-Advisor Portfolio Engine") as demo:
     gr.Markdown("# Robo-Advisor: Portfolio Engine (Baseline)")
     gr.Markdown(
         "Baseline allocation engine covering six asset classes via representative "
-        "ETFs, with two allocation methods: an age-driven lifecycle heuristic and "
-        "a long-only mean-variance optimizer. A research-informed method is planned "
-        "as a future third approach."
+        "ETFs, with three allocation methods: an age-driven lifecycle heuristic, "
+        "a long-only mean-variance optimizer personalized by risk tolerance and "
+        "horizon, and a research-informed method with a hump-shaped glide path "
+        "that also considers wealth and ongoing savings capacity."
     )
 
     with gr.Row():
@@ -372,7 +399,7 @@ with gr.Blocks(title="Robo-Advisor Portfolio Engine") as demo:
                 GOAL_OPTIONS, value="Retirement", label="Financial Goal"
             )
             method = gr.Radio(
-                [METHOD_LIFECYCLE, METHOD_MVO],
+                [METHOD_LIFECYCLE, METHOD_MVO, METHOD_RESEARCH],
                 value=METHOD_LIFECYCLE,
                 label="Allocation Method",
             )
@@ -391,7 +418,7 @@ with gr.Blocks(title="Robo-Advisor Portfolio Engine") as demo:
             gr.Markdown("### Projected Wealth")
             wealth_plot = gr.Plot(label="Projected Wealth")
 
-            gr.Markdown("### Lifecycle vs. Mean-Variance Comparison")
+            gr.Markdown("### Method Comparison")
             comparison_table = gr.Dataframe(label="Comparison", interactive=False)
             comparison_plot = gr.Plot(label="Allocation Comparison")
 

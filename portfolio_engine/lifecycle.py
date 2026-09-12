@@ -22,14 +22,21 @@ class RiskTolerance(str, Enum):
     AGGRESSIVE = "aggressive"
 
 
-_RISK_TOLERANCE_ADJUSTMENT = {
+# Shared with the research-informed method (research.py) so both heuristics
+# apply the same risk-tolerance/horizon nudges to their own age-driven
+# baseline instead of each defining their own numbers.
+RISK_TOLERANCE_ADJUSTMENT = {
     RiskTolerance.CONSERVATIVE: -0.10,
     RiskTolerance.MODERATE: 0.0,
     RiskTolerance.AGGRESSIVE: 0.10,
 }
 
 
-def _horizon_adjustment(horizon_years: float) -> float:
+def risk_tolerance_adjustment(risk_tolerance: RiskTolerance) -> float:
+    return RISK_TOLERANCE_ADJUSTMENT[RiskTolerance(risk_tolerance)]
+
+
+def horizon_adjustment(horizon_years: float) -> float:
     if horizon_years >= 20:
         return 0.05
     if horizon_years >= 10:
@@ -46,8 +53,8 @@ def lifecycle_equity_pct(
     base = (110 - age) / 100
     adjusted = (
         base
-        + _RISK_TOLERANCE_ADJUSTMENT[RiskTolerance(risk_tolerance)]
-        + _horizon_adjustment(horizon_years)
+        + risk_tolerance_adjustment(risk_tolerance)
+        + horizon_adjustment(horizon_years)
     )
     return min(max(adjusted, MIN_EQUITY_PCT), MAX_EQUITY_PCT)
 
