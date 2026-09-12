@@ -2,19 +2,29 @@ import os
 
 import gradio as gr
 import pandas as pd
+import plotly.graph_objects as go
 
 from dcf import run_dcf
 
 # =============================================================================
-# PART 1 — INPUT CONTROLS  /  PART 2 — DCF ENGINE
+# PART 1 — INPUT CONTROLS  /  PART 2 — DCF ENGINE  /  PART 3 — CHARTS
 #
 # Source for every "Case" figure below: "NVIDIA Corporation: Valuing the
 # Engine of the AI Revolution" (Asaf Manela, Olin Business School, case
 # written July 30, 2026), plus its accompanying exhibits workbook.
 #
-# The DCF math itself lives in dcf.py, kept fully separate from this UI file.
-# Part 3 (sensitivity charts / scenario analysis) is not built yet.
+# The DCF math itself lives in dcf.py, kept fully separate from this UI file
+# and unchanged by Part 3. Part 4 (further scenario analysis) is not built yet.
+#
+# Chart color language, used consistently across all three charts:
+#   blue   = adds value / favorable (revenue, FCF, positive bridge items, undervalued)
+#   orange = subtracts value / unfavorable (debt, overvalued)
+#   gray   = totals / subtotals
 # =============================================================================
+
+CHART_BLUE = "#3B6FA0"
+CHART_ORANGE = "#D98E42"
+CHART_GRAY = "#4d4d4d"
 
 # --- Starting financials (all case-sourced, Q1 FY2027 / July 29, 2026) -----
 CASE_BASE_REVENUE = 215.938              # $B, FY2026 actual revenue (Exhibit 1)
@@ -59,6 +69,153 @@ def _validation_banner(terminal_growth_rate, wacc):
     """
 
 
+def _placeholder_figure(message):
+    fig = go.Figure()
+    fig.add_annotation(
+        text=message, showarrow=False, font=dict(size=15, color="#888"),
+        xref="paper", yref="paper", x=0.5, y=0.5,
+    )
+    fig.update_layout(
+        xaxis=dict(visible=False), yaxis=dict(visible=False),
+        height=320, plot_bgcolor="white", paper_bgcolor="white",
+    )
+    return fig
+
+
+def build_revenue_fcf_chart(years):
+    year_numbers = [y.year for y in years]
+    revenue_values = [y.revenue for y in years]
+    fcf_values = [y.free_cash_flow for y in years]
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=year_numbers, y=revenue_values, mode="lines+markers", name="Revenue",
+        line=dict(color=CHART_BLUE, width=3), marker=dict(size=7),
+        hovertemplate="Year %{x}<br>Revenue: $%{y:,.0f}B<extra></extra>",
+    ))
+    fig.add_trace(go.Scatter(
+        x=year_numbers, y=fcf_values, mode="lines+markers", name="Free Cash Flow",
+        line=dict(color=CHART_ORANGE, width=3), marker=dict(size=7),
+        hovertemplate="Year %{x}<br>FCF: $%{y:,.0f}B<extra></extra>",
+    ))
+    fig.update_layout(
+        title="Revenue & Free Cash Flow — 10-Year Forecast",
+        xaxis_title="Forecast Year", yaxis_title="$ Billions",
+        xaxis=dict(dtick=1, gridcolor="rgba(120,120,120,0.15)"),
+        yaxis=dict(gridcolor="rgba(120,120,120,0.15)"),
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        margin=dict(l=60, r=30, t=60, b=50),
+        height=420, plot_bgcolor="white", paper_bgcolor="white",
+    )
+    return fig
+
+
+def build_waterfall_chart(result, cash_and_securities, nonmarketable_securities, total_debt):
+    labels = [
+        "PV of Forecast FCF<br>(Years 1-10)", "PV of Terminal Value", "Enterprise Value",
+        "+ Cash & Marketable<br>Securities", "+ Non-Marketable<br>Securities", "− Total Debt",
+        "Equity Value",
+    ]
+    measures = ["relative", "relative", "total", "relative", "relative", "relative", "total"]
+    values = [
+        result.pv_of_forecast_years, result.pv_of_terminal_value, result.enterprise_value,
+        cash_and_securities, nonmarketable_securities, -total_debt, result.equity_value,
+    ]
+
+    fig = go.Figure(go.Waterfall(
+        orientation="v",
+        measure=measures,
+        x=labels,
+        y=values,
+        text=[f"${v:,.0f}B" for v in values],
+        textposition="outside",
+        connector=dict(line=dict(color="rgba(120,120,120,0.4)", width=1)),
+        increasing=dict(marker=dict(color=CHART_BLUE)),
+        decreasing=dict(marker=dict(color=CHART_ORANGE)),
+        totals=dict(marker=dict(color=CHART_GRAY)),
+        hovertemplate="%{x}<br>$%{y:,.1f}B<extra></extra>",
+    ))
+    fig.update_layout(
+        title="Valuation Waterfall — Enterprise Value to Equity Value",
+        yaxis_title="$ Billions",
+        yaxis=dict(gridcolor="rgba(120,120,120,0.15)"),
+        showlegend=False,
+        margin=dict(l=60, r=30, t=60, b=90),
+        height=460, plot_bgcolor="white", paper_bgcolor="white",
+    )
+    return fig
+
+
+# Sensitivity heatmap grid (percent). WACC min (8%) safely exceeds terminal
+# growth max (5%) across the whole grid, so every cell is a valid DCF input.
+SENSITIVITY_WACC_GRID = [8, 9, 10, 11, 12, 13, 14]
+SENSITIVITY_TERMINAL_GRID = [1, 2, 3, 4, 5]
+
+
+def build_sensitivity_heatmap(
+    base_revenue,
+    revenue_growth_y1, revenue_growth_y2, revenue_growth_y3, revenue_growth_y4, revenue_growth_y5,
+    revenue_growth_long_term,
+    operating_margin_y1, operating_margin_y2, operating_margin_y3, operating_margin_y4, operating_margin_y5,
+    tax_rate, capex_pct_revenue, nwc_pct_revenue,
+    equity_risk_premium, beta,
+    cash_and_securities, nonmarketable_securities, total_debt, shares_outstanding,
+    current_share_price,
+):
+    erp_decimal = equity_risk_premium / 100
+
+    z = []
+    for terminal_pct in SENSITIVITY_TERMINAL_GRID:
+        row = []
+        for wacc_pct in SENSITIVITY_WACC_GRID:
+            wacc_decimal = wacc_pct / 100
+            # Hold beta/ERP fixed at their current slider values and back out
+            # the risk-free rate that produces this grid cell's target WACC,
+            # so the sweep goes through the same public run_dcf() the rest of
+            # the app uses (dcf.py's CAPM formula is untouched).
+            risk_free_for_cell = wacc_decimal - beta * erp_decimal
+            result = run_dcf(
+                base_revenue=base_revenue,
+                revenue_growth_y1=revenue_growth_y1 / 100, revenue_growth_y2=revenue_growth_y2 / 100,
+                revenue_growth_y3=revenue_growth_y3 / 100, revenue_growth_y4=revenue_growth_y4 / 100,
+                revenue_growth_y5=revenue_growth_y5 / 100,
+                revenue_growth_long_term=revenue_growth_long_term / 100,
+                terminal_growth_rate=terminal_pct / 100,
+                operating_margin_y1=operating_margin_y1 / 100, operating_margin_y2=operating_margin_y2 / 100,
+                operating_margin_y3=operating_margin_y3 / 100, operating_margin_y4=operating_margin_y4 / 100,
+                operating_margin_y5=operating_margin_y5 / 100,
+                tax_rate=tax_rate / 100,
+                capex_pct_of_revenue=capex_pct_revenue / 100,
+                nwc_pct_of_revenue_increase=nwc_pct_revenue / 100,
+                risk_free_rate=risk_free_for_cell, equity_risk_premium=erp_decimal, beta=beta,
+                cash_and_securities=cash_and_securities, nonmarketable_securities=nonmarketable_securities,
+                total_debt=total_debt, shares_outstanding=shares_outstanding,
+            )
+            row.append(result.value_per_share)
+        z.append(row)
+
+    fig = go.Figure(data=go.Heatmap(
+        z=z,
+        x=[f"{w}%" for w in SENSITIVITY_WACC_GRID],
+        y=[f"{g}%" for g in SENSITIVITY_TERMINAL_GRID],
+        colorscale=[[0.0, "#B35806"], [0.5, "#F5F1EA"], [1.0, "#2166AC"]],
+        zmid=current_share_price,
+        text=[[f"${v:,.0f}" for v in row] for row in z],
+        texttemplate="%{text}",
+        textfont={"size": 12},
+        hovertemplate="WACC %{x}<br>Terminal growth %{y}<br>Intrinsic value $%{z:,.2f}<extra></extra>",
+        colorbar=dict(title="$/share"),
+    ))
+    fig.update_layout(
+        title=f"Intrinsic Value per Share — WACC vs. Terminal Growth "
+              f"(blue = above ${current_share_price:,.0f} current price, orange = below)",
+        xaxis_title="WACC", yaxis_title="Terminal Growth Rate",
+        height=440, margin=dict(l=60, r=40, t=70, b=50),
+    )
+    return fig
+
+
 def run_valuation(
     base_revenue, cash_and_securities, nonmarketable_securities, total_debt,
     shares_outstanding, current_share_price,
@@ -77,7 +234,11 @@ def run_valuation(
             "Year", "Growth %", "Revenue ($B)", "Op. Margin %", "NOPAT ($B)",
             "D&A ($B)", "CapEx ($B)", "ΔNWC ($B)", "FCF ($B)", "PV of FCF ($B)",
         ])
-        return banner, empty_forecast, "*Fix the invalid assumption above to see the valuation.*"
+        placeholder = _placeholder_figure("Fix the invalid assumption above to see this chart.")
+        return (
+            banner, empty_forecast, "*Fix the invalid assumption above to see the valuation.*",
+            placeholder, placeholder,
+        )
 
     result = run_dcf(
         base_revenue=base_revenue,
@@ -130,7 +291,10 @@ def run_valuation(
 | Current Share Price (for reference) | ${current_share_price:,.2f} |
 """
 
-    return banner, forecast_table, valuation_summary
+    revenue_fcf_fig = build_revenue_fcf_chart(result.years)
+    waterfall_fig = build_waterfall_chart(result, cash_and_securities, nonmarketable_securities, total_debt)
+
+    return banner, forecast_table, valuation_summary, revenue_fcf_fig, waterfall_fig
 
 
 with gr.Blocks(title="NVIDIA DCF Valuation") as demo:
@@ -278,6 +442,12 @@ with gr.Blocks(title="NVIDIA DCF Valuation") as demo:
     gr.Markdown("### Valuation Summary — Enterprise Value, Equity Value, Intrinsic Value per Share")
     valuation_output = gr.Markdown()
 
+    gr.Markdown("### Charts")
+    with gr.Row():
+        revenue_fcf_output = gr.Plot()
+        waterfall_output = gr.Plot()
+    sensitivity_output = gr.Plot()
+
     all_inputs = [
         base_revenue, cash_and_securities, nonmarketable_securities, total_debt,
         shares_outstanding, current_share_price,
@@ -288,12 +458,29 @@ with gr.Blocks(title="NVIDIA DCF Valuation") as demo:
         tax_rate, risk_free_rate, equity_risk_premium, beta,
         capex_pct_revenue, nwc_pct_revenue,
     ]
-    all_outputs = [validation_banner, forecast_output, valuation_output]
+    all_outputs = [validation_banner, forecast_output, valuation_output, revenue_fcf_output, waterfall_output]
+
+    # Sensitivity heatmap sweeps WACC and terminal growth itself, so those two
+    # sliders are excluded from its input list — everything else feeds it.
+    sensitivity_inputs = [
+        base_revenue,
+        revenue_growth_y1, revenue_growth_y2, revenue_growth_y3, revenue_growth_y4, revenue_growth_y5,
+        revenue_growth_long_term,
+        operating_margin_y1, operating_margin_y2, operating_margin_y3, operating_margin_y4, operating_margin_y5,
+        tax_rate, capex_pct_revenue, nwc_pct_revenue,
+        equity_risk_premium, beta,
+        cash_and_securities, nonmarketable_securities, total_debt, shares_outstanding,
+        current_share_price,
+    ]
 
     for component in all_inputs:
         component.change(fn=run_valuation, inputs=all_inputs, outputs=all_outputs)
 
+    for component in sensitivity_inputs:
+        component.change(fn=build_sensitivity_heatmap, inputs=sensitivity_inputs, outputs=sensitivity_output)
+
     demo.load(fn=run_valuation, inputs=all_inputs, outputs=all_outputs)
+    demo.load(fn=build_sensitivity_heatmap, inputs=sensitivity_inputs, outputs=sensitivity_output)
 
 if __name__ == "__main__":
     demo.launch(share=os.environ.get("GRADIO_SHARE") == "1")
