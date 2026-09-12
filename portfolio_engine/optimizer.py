@@ -1,4 +1,7 @@
-"""Mean-variance optimization: long-only max-Sharpe (tangency) portfolio."""
+"""Mean-variance optimization: long-only max-Sharpe (tangency) portfolio,
+plus a risk-aversion-parameterized utility optimizer used to pick a
+client-appropriate point on the efficient frontier.
+"""
 
 import numpy as np
 import pandas as pd
@@ -46,6 +49,53 @@ def mean_variance_optimize(
 
     weights = np.clip(result.x, 0.0, None)
     weights = weights / weights.sum()  # clean up tiny negatives / float drift
+    return pd.Series(weights, index=assets)
+
+
+def maximize_utility(
+    expected_returns: pd.Series,
+    cov_matrix: pd.DataFrame,
+    risk_aversion: float,
+) -> pd.Series:
+    """Long-only, fully-invested portfolio maximizing mean-variance utility:
+
+        U(w) = w . mu  -  0.5 * risk_aversion * w' Sigma w
+
+    A higher risk_aversion pulls the result toward the global minimum-
+    variance portfolio; a lower risk_aversion pulls it toward the
+    highest-return corner. This is how the optimizer is made client-
+    specific: risk tolerance and horizon are translated into a
+    risk_aversion coefficient (see risk_profile.py) instead of always
+    solving for the single max-Sharpe portfolio.
+    """
+    assets = list(expected_returns.index)
+    n = len(assets)
+    mu = expected_returns.values
+    cov = cov_matrix.loc[assets, assets].values
+
+    def negative_utility(w: np.ndarray) -> float:
+        ret = float(np.dot(w, mu))
+        var = float(w @ cov @ w)
+        return -(ret - 0.5 * risk_aversion * var)
+
+    constraints = ({"type": "eq", "fun": lambda w: np.sum(w) - 1.0},)
+    bounds = tuple((0.0, 1.0) for _ in range(n))
+    initial_guess = np.full(n, 1.0 / n)
+
+    result = minimize(
+        negative_utility,
+        initial_guess,
+        method="SLSQP",
+        bounds=bounds,
+        constraints=constraints,
+        options={"maxiter": 1000, "ftol": 1e-12},
+    )
+
+    if not result.success:
+        raise RuntimeError(f"utility-maximizing optimization failed: {result.message}")
+
+    weights = np.clip(result.x, 0.0, None)
+    weights = weights / weights.sum()
     return pd.Series(weights, index=assets)
 
 

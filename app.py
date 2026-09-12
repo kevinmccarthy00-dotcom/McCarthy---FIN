@@ -252,7 +252,7 @@ def _plot_frontier(market_data, frontier_df, mvo_result, lifecycle_result):
         color="tab:red",
         marker="*",
         s=250,
-        label="Max-Sharpe Portfolio",
+        label="Optimized Portfolio (your risk profile)",
         zorder=3,
     )
     ax.scatter(
@@ -299,7 +299,11 @@ def generate_portfolio(
         horizon_years=horizon_years,
         market_data=market_data,
     )
-    mvo_result = build_mvo_portfolio(market_data=market_data)
+    mvo_result = build_mvo_portfolio(
+        risk_tolerance=risk_tolerance,
+        horizon_years=horizon_years,
+        market_data=market_data,
+    )
 
     is_mvo = method_label == METHOD_MVO
     primary = mvo_result if is_mvo else lifecycle_result

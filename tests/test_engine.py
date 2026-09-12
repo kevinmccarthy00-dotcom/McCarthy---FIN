@@ -43,3 +43,47 @@ def test_result_to_dict_is_json_serializable_shape():
     payload = result.to_dict()
     json.dumps(payload)  # should not raise
     assert "weights" in payload and "expected_return" in payload
+
+
+def test_mvo_portfolio_responds_to_risk_tolerance():
+    from portfolio_engine.assets import EQUITY_KEYS
+    from portfolio_engine.data import get_market_data
+
+    market_data = get_market_data()
+    conservative = build_mvo_portfolio(
+        risk_tolerance=RiskTolerance.CONSERVATIVE, horizon_years=20, market_data=market_data
+    )
+    aggressive = build_mvo_portfolio(
+        risk_tolerance=RiskTolerance.AGGRESSIVE, horizon_years=20, market_data=market_data
+    )
+    assert aggressive.weights[EQUITY_KEYS].sum() > conservative.weights[EQUITY_KEYS].sum()
+    assert aggressive.expected_volatility > conservative.expected_volatility
+
+
+def test_mvo_portfolio_responds_to_horizon():
+    from portfolio_engine.assets import EQUITY_KEYS
+    from portfolio_engine.data import get_market_data
+
+    market_data = get_market_data()
+    short_horizon = build_mvo_portfolio(
+        risk_tolerance=RiskTolerance.MODERATE, horizon_years=3, market_data=market_data
+    )
+    long_horizon = build_mvo_portfolio(
+        risk_tolerance=RiskTolerance.MODERATE, horizon_years=30, market_data=market_data
+    )
+    assert long_horizon.weights[EQUITY_KEYS].sum() > short_horizon.weights[EQUITY_KEYS].sum()
+
+
+def test_two_standard_test_clients_get_different_mvo_portfolios():
+    # Regression guard: same risk tolerance (moderate) but different
+    # horizons (30y vs 20y) must not collapse to an identical portfolio.
+    from portfolio_engine.data import get_market_data
+
+    market_data = get_market_data()
+    client_a = build_mvo_portfolio(
+        risk_tolerance=RiskTolerance.MODERATE, horizon_years=30, market_data=market_data
+    )
+    client_b = build_mvo_portfolio(
+        risk_tolerance=RiskTolerance.MODERATE, horizon_years=20, market_data=market_data
+    )
+    assert not client_a.weights.equals(client_b.weights)

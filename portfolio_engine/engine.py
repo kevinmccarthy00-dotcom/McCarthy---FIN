@@ -13,7 +13,8 @@ from portfolio_engine.assets import ASSET_CLASSES, TICKER_BY_KEY
 from portfolio_engine.data import MarketData, get_market_data
 from portfolio_engine.lifecycle import RiskTolerance, lifecycle_allocation
 from portfolio_engine.metrics import portfolio_return, portfolio_volatility, sharpe_ratio
-from portfolio_engine.optimizer import efficient_frontier, mean_variance_optimize
+from portfolio_engine.optimizer import efficient_frontier, maximize_utility
+from portfolio_engine.risk_profile import risk_aversion_for_profile
 
 DEFAULT_RISK_FREE_RATE = 0.02
 
@@ -88,15 +89,32 @@ def build_lifecycle_portfolio(
 
 
 def build_mvo_portfolio(
+    risk_tolerance: RiskTolerance = RiskTolerance.MODERATE,
+    horizon_years: float = 20,
     risk_free_rate: float = DEFAULT_RISK_FREE_RATE,
     market_data: MarketData | None = None,
 ) -> PortfolioResult:
-    """Long-only, max-Sharpe mean-variance optimized allocation."""
+    """Long-only mean-variance optimized allocation.
+
+    Risk tolerance and horizon are translated into a risk-aversion
+    coefficient (see risk_profile.py) that picks a client-appropriate point
+    on the efficient frontier - a more conservative or short-horizon client
+    lands closer to the minimum-variance end, a more aggressive or
+    long-horizon client closer to the higher-return end - rather than
+    always solving for the single max-Sharpe portfolio regardless of who's
+    asking.
+    """
     market_data = market_data or get_market_data()
-    weights = mean_variance_optimize(
-        market_data.expected_returns, market_data.cov_matrix, risk_free_rate
+    risk_aversion = risk_aversion_for_profile(risk_tolerance, horizon_years)
+    weights = maximize_utility(
+        market_data.expected_returns, market_data.cov_matrix, risk_aversion
     )
-    inputs = {"risk_free_rate": risk_free_rate}
+    inputs = {
+        "risk_tolerance": RiskTolerance(risk_tolerance).value,
+        "horizon_years": horizon_years,
+        "risk_aversion": risk_aversion,
+        "risk_free_rate": risk_free_rate,
+    }
     return _summarize("mean_variance", weights, market_data, risk_free_rate, inputs)
 
 
