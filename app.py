@@ -367,7 +367,7 @@ def generate_portfolio(
 
 
 with gr.Blocks(title="Robo-Advisor Portfolio Engine") as demo:
-    gr.Markdown("# Robo-Advisor: Portfolio Engine (Baseline)")
+    gr.Markdown("# Robo-Advisor: Portfolio Engine")
     gr.Markdown(
         "Baseline allocation engine covering six asset classes via representative "
         "ETFs, with three allocation methods: an age-driven lifecycle heuristic, "
