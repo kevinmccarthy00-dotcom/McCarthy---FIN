@@ -1,1 +1,6 @@
 gradio
+numpy
+pandas
+scipy
+yfinance
+pytest
