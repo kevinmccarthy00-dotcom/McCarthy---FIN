@@ -15,25 +15,41 @@ cursor/offset pagination, so the only way to retrieve more than 250 articles
 for a date range is to split that range into smaller windows and query each
 one separately.
 
-Rather than requesting one day at a time (365 requests for a full year, and
-the main cause of the 429s seen in the local run), this script queries the
-*entire* requested date range in a single request first. Only if a window's
-response comes back at the 250-record cap (meaning it was truncated and
-articles may be missing) does the script split that window in half and
-re-query each half, recursing until either a window's result is under the
-cap or the window has shrunk to one hour (MIN_SPLIT_WINDOW), at which point
-it accepts what GDELT returned and logs a warning that some articles for
-that hour may be missing.
+Rather than requesting one day at a time, this script queries the *entire*
+requested date range in a single request first. Only if a window's response
+comes back at the 250-record cap (meaning it was truncated and articles may
+be missing) does the script split that window in half and re-query each
+half, recursing until either a window's result is under the cap or the
+window has shrunk to one hour (MIN_SPLIT_WINDOW), at which point it accepts
+what GDELT returned and logs a warning that some articles for that hour may
+be missing. This keeps total request count roughly proportional to article
+volume rather than to the number of days requested.
 
-This means low-news-volume periods cost a single request, and only
-genuinely high-volume periods incur the extra requests needed to page
-through them -- keeping the total request count roughly proportional to
-article volume rather than to the number of days requested.
+Rate-limit handling
+--------------------
+GDELT can still return HTTP 429 even on the first request. Each window is
+retried up to RATE_LIMIT_MAX_RETRIES times with a slow exponential backoff
+(60s, 120s, 240s, 480s, capped at RATE_LIMIT_MAX_BACKOFF_SECONDS), with
+random jitter so retries from a single run don't land on perfectly
+predictable intervals. If GDELT sends a Retry-After header, that value is
+always honored even when it's longer than the scheduled backoff.
+
+Checkpointing
+-------------
+Every window that finishes successfully (either under the record cap, or a
+window GDELT is known to require splitting) is saved to a checkpoint file
+under data/gdelt/checkpoints/ as soon as it completes. If the script is
+interrupted -- by a long rate-limit wait, a crash, or a manual stop -- simply
+rerunning it with the same --days value resumes from the checkpoint instead
+of re-fetching windows that already succeeded. Delete the checkpoint file
+for a --days value to force a fully fresh run.
 """
 
 import argparse
 import csv
+import json
 import logging
+import random
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -46,12 +62,20 @@ DOMAIN = "cnbc.com"
 DEFAULT_DAYS = 30
 MAX_RECORDS_PER_REQUEST = 250
 REQUEST_TIMEOUT_SECONDS = 30
+
 MAX_RETRIES = 3
 RETRY_BACKOFF_SECONDS = 5
-RATE_LIMIT_BACKOFF_SECONDS = [30, 60, 120]
+
+RATE_LIMIT_MAX_RETRIES = 7
+RATE_LIMIT_BASE_BACKOFF_SECONDS = 60
+RATE_LIMIT_MAX_BACKOFF_SECONDS = 480
+JITTER_FRACTION = 0.25
+
 DELAY_BETWEEN_REQUESTS_SECONDS = 3
 MIN_SPLIT_WINDOW = timedelta(hours=1)
+
 OUTPUT_DIR = Path(__file__).resolve().parent.parent / "data" / "gdelt"
+CHECKPOINT_DIR = OUTPUT_DIR / "checkpoints"
 CSV_COLUMNS = ["seendate", "title", "domain", "url"]
 
 logging.basicConfig(
@@ -62,14 +86,114 @@ logging.basicConfig(
 logger = logging.getLogger("gdelt_cnbc_headlines")
 
 
+def with_jitter(seconds):
+    """Apply +/- JITTER_FRACTION random jitter to a wait time, floored at 0."""
+    jitter = seconds * JITTER_FRACTION
+    return max(0.0, seconds + random.uniform(-jitter, jitter))
+
+
+def rate_limit_backoff_seconds(attempt_number):
+    """Exponential backoff for the given 1-indexed 429 retry attempt."""
+    backoff = RATE_LIMIT_BASE_BACKOFF_SECONDS * (2 ** (attempt_number - 1))
+    return min(backoff, RATE_LIMIT_MAX_BACKOFF_SECONDS)
+
+
+class Checkpoint:
+    """Tracks which date windows have already been resolved for a run.
+
+    A window is either "done" (its final article list is known, because the
+    response came in under the record cap or the split floor was hit) or a
+    known "split" (its midpoint, once we've learned it needs to be divided).
+    Both are persisted to disk immediately so a rerun with the same --days
+    value can skip straight past already-resolved windows.
+    """
+
+    def __init__(self, path, domain, days, default_start, default_end):
+        self.path = path
+        self.domain = domain
+        self.days = days
+        self.start_time = default_start
+        self.end_time = default_end
+        self.done_windows = {}
+        self.split_windows = {}
+        self._load()
+        self._save()
+
+    def _load(self):
+        if not self.path.exists():
+            return
+        try:
+            data = json.loads(self.path.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning("Could not read checkpoint file %s (%s); starting fresh", self.path, exc)
+            return
+
+        if data.get("domain") != self.domain or data.get("days") != self.days:
+            logger.warning(
+                "Checkpoint %s is for different parameters; starting fresh", self.path,
+            )
+            return
+
+        self.start_time = datetime.fromisoformat(data["start_time"])
+        self.end_time = datetime.fromisoformat(data["end_time"])
+        for entry in data.get("done_windows", []):
+            self.done_windows[(entry["start"], entry["end"])] = entry["articles"]
+        for entry in data.get("split_windows", []):
+            self.split_windows[(entry["start"], entry["end"])] = entry["midpoint"]
+
+        logger.info(
+            "Resuming from checkpoint %s: %d window(s) already done, %d known split(s)",
+            self.path, len(self.done_windows), len(self.split_windows),
+        )
+
+    def _save(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        data = {
+            "domain": self.domain,
+            "days": self.days,
+            "start_time": self.start_time.isoformat(),
+            "end_time": self.end_time.isoformat(),
+            "done_windows": [
+                {"start": s, "end": e, "articles": articles}
+                for (s, e), articles in self.done_windows.items()
+            ],
+            "split_windows": [
+                {"start": s, "end": e, "midpoint": midpoint}
+                for (s, e), midpoint in self.split_windows.items()
+            ],
+        }
+        tmp_path = self.path.with_name(self.path.name + ".tmp")
+        tmp_path.write_text(json.dumps(data))
+        tmp_path.replace(self.path)
+
+    @staticmethod
+    def _key(start_dt, end_dt):
+        return (start_dt.isoformat(), end_dt.isoformat())
+
+    def get_done(self, start_dt, end_dt):
+        return self.done_windows.get(self._key(start_dt, end_dt))
+
+    def mark_done(self, start_dt, end_dt, articles):
+        self.done_windows[self._key(start_dt, end_dt)] = articles
+        self._save()
+
+    def get_split(self, start_dt, end_dt):
+        midpoint = self.split_windows.get(self._key(start_dt, end_dt))
+        return datetime.fromisoformat(midpoint) if midpoint else None
+
+    def mark_split(self, start_dt, end_dt, midpoint_dt):
+        self.split_windows[self._key(start_dt, end_dt)] = midpoint_dt.isoformat()
+        self._save()
+
+
 def fetch_raw(start_dt, end_dt, stats):
     """Issue one GDELT request for a window, retrying on transient failures.
 
     HTTP 429 is retried separately from other transient failures, using a
-    longer exponential backoff and honoring the Retry-After header when
-    GDELT provides one. Returns the list of articles on success (which may
-    be empty), or None if the window could not be fetched after exhausting
-    retries.
+    slow exponential backoff with jitter and honoring the Retry-After header
+    when GDELT provides one (even if it's longer than the scheduled wait).
+    Returns the list of articles on success (which may be empty), or None if
+    the window could not be fetched after exhausting retries.
     """
     params = {
         "query": f"domain:{DOMAIN}",
@@ -101,24 +225,29 @@ def fetch_raw(start_dt, end_dt, stats):
 
         if response.status_code == 429:
             rate_limit_attempt += 1
-            if rate_limit_attempt > len(RATE_LIMIT_BACKOFF_SECONDS):
+            if rate_limit_attempt > RATE_LIMIT_MAX_RETRIES:
                 logger.error(
                     "Giving up on window %s -> %s after %d rate-limit retries",
-                    start_dt, end_dt, len(RATE_LIMIT_BACKOFF_SECONDS),
+                    start_dt, end_dt, RATE_LIMIT_MAX_RETRIES,
                 )
                 return None
 
-            wait_seconds = RATE_LIMIT_BACKOFF_SECONDS[rate_limit_attempt - 1]
+            wait_seconds = with_jitter(rate_limit_backoff_seconds(rate_limit_attempt))
             retry_after = response.headers.get("Retry-After")
             if retry_after:
                 try:
-                    wait_seconds = max(wait_seconds, float(retry_after))
+                    retry_after_seconds = float(retry_after)
+                    logger.info(
+                        "GDELT sent Retry-After: %.0fs for window %s -> %s",
+                        retry_after_seconds, start_dt, end_dt,
+                    )
+                    wait_seconds = max(wait_seconds, retry_after_seconds)
                 except ValueError:
                     logger.warning("Ignoring unparseable Retry-After header: %r", retry_after)
 
             logger.warning(
                 "Rate limited (429) for window %s -> %s (retry %d/%d), waiting %.0fs",
-                start_dt, end_dt, rate_limit_attempt, len(RATE_LIMIT_BACKOFF_SECONDS), wait_seconds,
+                start_dt, end_dt, rate_limit_attempt, RATE_LIMIT_MAX_RETRIES, wait_seconds,
             )
             time.sleep(wait_seconds)
             continue
@@ -146,22 +275,42 @@ def fetch_raw(start_dt, end_dt, stats):
     return None
 
 
-def fetch_window_recursive(start_dt, end_dt, stats):
+def fetch_window_recursive(start_dt, end_dt, stats, checkpoint):
     """Fetch all articles in [start_dt, end_dt), splitting the window if the
-    250-record cap was hit so no articles are silently dropped.
+    250-record cap was hit so no articles are silently dropped. Windows
+    already resolved in the checkpoint are served from disk without making
+    a request.
     """
+    cached = checkpoint.get_done(start_dt, end_dt)
+    if cached is not None:
+        logger.info("Window %s -> %s already completed (checkpoint): %d articles", start_dt, end_dt, len(cached))
+        return cached
+
+    known_midpoint = checkpoint.get_split(start_dt, end_dt)
+    if known_midpoint is not None:
+        logger.info(
+            "Window %s -> %s already known to require splitting (checkpoint); resuming both halves",
+            start_dt, end_dt,
+        )
+        left = fetch_window_recursive(start_dt, known_midpoint, stats, checkpoint)
+        right = fetch_window_recursive(known_midpoint, end_dt, stats, checkpoint)
+        return left + right
+
+    time.sleep(with_jitter(DELAY_BETWEEN_REQUESTS_SECONDS))
     logger.info("Querying window %s -> %s", start_dt, end_dt)
     articles = fetch_raw(start_dt, end_dt, stats)
 
     if articles is None:
         logger.error(
-            "Skipping window %s -> %s after repeated failures; results will be incomplete",
+            "Skipping window %s -> %s after repeated failures; results will be incomplete "
+            "(rerun with the same --days to retry just this window)",
             start_dt, end_dt,
         )
         return []
 
     if len(articles) < MAX_RECORDS_PER_REQUEST:
         logger.info("Window %s -> %s: retrieved %d articles", start_dt, end_dt, len(articles))
+        checkpoint.mark_done(start_dt, end_dt, articles)
         return articles
 
     window_length = end_dt - start_dt
@@ -171,6 +320,7 @@ def fetch_window_recursive(start_dt, end_dt, stats):
             "granularity (%s); some articles in this window may be missing",
             start_dt, end_dt, MAX_RECORDS_PER_REQUEST, MIN_SPLIT_WINDOW,
         )
+        checkpoint.mark_done(start_dt, end_dt, articles)
         return articles
 
     midpoint = start_dt + window_length / 2
@@ -179,25 +329,30 @@ def fetch_window_recursive(start_dt, end_dt, stats):
         "Window %s -> %s hit the %d-record cap; splitting at %s and re-querying both halves",
         start_dt, end_dt, MAX_RECORDS_PER_REQUEST, midpoint,
     )
+    checkpoint.mark_split(start_dt, end_dt, midpoint)
 
-    time.sleep(DELAY_BETWEEN_REQUESTS_SECONDS)
-    left = fetch_window_recursive(start_dt, midpoint, stats)
-    time.sleep(DELAY_BETWEEN_REQUESTS_SECONDS)
-    right = fetch_window_recursive(midpoint, end_dt, stats)
+    left = fetch_window_recursive(start_dt, midpoint, stats, checkpoint)
+    right = fetch_window_recursive(midpoint, end_dt, stats, checkpoint)
     return left + right
 
 
 def collect_articles(days):
-    end_time = datetime.now(timezone.utc)
-    start_time = end_time - timedelta(days=days)
+    now = datetime.now(timezone.utc)
+    proposed_start = now - timedelta(days=days)
+
+    checkpoint_path = CHECKPOINT_DIR / f"cnbc_headlines_{days}d.checkpoint.json"
+    checkpoint = Checkpoint(checkpoint_path, DOMAIN, days, proposed_start, now)
+    start_time = checkpoint.start_time
+    end_time = checkpoint.end_time
 
     logger.info(
         "Downloading %s headlines from %s to %s (UTC) using adaptive date-window splitting",
         DOMAIN, start_time.isoformat(), end_time.isoformat(),
     )
+    logger.info("Checkpoint file: %s", checkpoint_path)
 
     stats = {"total_requests": 0, "windows_split": 0}
-    raw_articles = fetch_window_recursive(start_time, end_time, stats)
+    raw_articles = fetch_window_recursive(start_time, end_time, stats, checkpoint)
 
     articles_by_url = {}
     for article in raw_articles:
