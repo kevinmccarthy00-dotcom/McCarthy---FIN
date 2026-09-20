@@ -24,7 +24,8 @@ MAX_RECORDS_PER_REQUEST = 250
 REQUEST_TIMEOUT_SECONDS = 30
 MAX_RETRIES = 3
 RETRY_BACKOFF_SECONDS = 5
-DELAY_BETWEEN_REQUESTS_SECONDS = 1.5
+RATE_LIMIT_BACKOFF_SECONDS = [30, 60, 120]
+DELAY_BETWEEN_REQUESTS_SECONDS = 3
 OUTPUT_DIR = Path(__file__).resolve().parent.parent / "data" / "gdelt"
 CSV_COLUMNS = ["seendate", "title", "domain", "url"]
 
@@ -37,7 +38,12 @@ logger = logging.getLogger("gdelt_cnbc_headlines")
 
 
 def fetch_window(start_dt, end_dt):
-    """Fetch articles for a single time window, retrying on transient failures."""
+    """Fetch articles for a single time window, retrying on transient failures.
+
+    HTTP 429 (rate limited) is retried separately from other transient
+    failures, using a longer exponential backoff and honoring the
+    Retry-After header when GDELT provides one.
+    """
     params = {
         "query": f"domain:{DOMAIN}",
         "mode": "ArtList",
@@ -48,9 +54,48 @@ def fetch_window(start_dt, end_dt):
         "enddatetime": end_dt.strftime("%Y%m%d%H%M%S"),
     }
 
-    for attempt in range(1, MAX_RETRIES + 1):
+    attempt = 0
+    rate_limit_attempt = 0
+
+    while True:
+        attempt += 1
         try:
             response = requests.get(GDELT_DOC_API, params=params, timeout=REQUEST_TIMEOUT_SECONDS)
+        except requests.exceptions.RequestException as exc:
+            logger.warning(
+                "Request failed for window %s -> %s (attempt %d/%d): %s",
+                start_dt, end_dt, attempt, MAX_RETRIES, exc,
+            )
+            if attempt >= MAX_RETRIES:
+                break
+            time.sleep(RETRY_BACKOFF_SECONDS * attempt)
+            continue
+
+        if response.status_code == 429:
+            rate_limit_attempt += 1
+            if rate_limit_attempt > len(RATE_LIMIT_BACKOFF_SECONDS):
+                logger.error(
+                    "Giving up on window %s -> %s after %d rate-limit retries",
+                    start_dt, end_dt, len(RATE_LIMIT_BACKOFF_SECONDS),
+                )
+                return []
+
+            wait_seconds = RATE_LIMIT_BACKOFF_SECONDS[rate_limit_attempt - 1]
+            retry_after = response.headers.get("Retry-After")
+            if retry_after:
+                try:
+                    wait_seconds = max(wait_seconds, float(retry_after))
+                except ValueError:
+                    logger.warning("Ignoring unparseable Retry-After header: %r", retry_after)
+
+            logger.warning(
+                "Rate limited (429) for window %s -> %s (retry %d/%d), waiting %.0fs",
+                start_dt, end_dt, rate_limit_attempt, len(RATE_LIMIT_BACKOFF_SECONDS), wait_seconds,
+            )
+            time.sleep(wait_seconds)
+            continue
+
+        try:
             response.raise_for_status()
             payload = response.json()
             return payload.get("articles", [])
@@ -65,8 +110,9 @@ def fetch_window(start_dt, end_dt):
                 start_dt, end_dt, attempt, MAX_RETRIES, exc,
             )
 
-        if attempt < MAX_RETRIES:
-            time.sleep(RETRY_BACKOFF_SECONDS * attempt)
+        if attempt >= MAX_RETRIES:
+            break
+        time.sleep(RETRY_BACKOFF_SECONDS * attempt)
 
     logger.error("Giving up on window %s -> %s after %d attempts", start_dt, end_dt, MAX_RETRIES)
     return []
