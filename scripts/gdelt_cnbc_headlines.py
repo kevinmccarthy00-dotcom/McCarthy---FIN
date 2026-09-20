@@ -12,6 +12,10 @@ Usage:
     # when there's no time left for the adaptive/checkpointed modes above:
     python scripts/gdelt_cnbc_headlines.py --quick-sample 7
 
+    # Quick sample ending on a historical date instead of today (e.g. to
+    # line up with a Ken French factor file that doesn't yet cover today):
+    python scripts/gdelt_cnbc_headlines.py --quick-sample 3 --end-date 2026-07-30
+
 Writes a deduplicated CSV (by article URL) with columns:
 seendate, title, domain, url
 into data/gdelt/, plus a "<csv name>.meta.json" sidecar recording whether
@@ -72,6 +76,12 @@ that always marks the dataset as a partial "quick sample" and states plainly
 whether the 250-record cap was hit. Use it when there's no time left for a
 full adaptive run; use `--days`/`--export-only` above for a more complete
 pull.
+
+By default the window ends at the current time. Pass `--end-date
+YYYY-MM-DD` (quick-sample mode only) to end the window at 23:59:59 UTC on a
+historical date instead -- e.g. to match a headlines sample to a Ken French
+factor file whose coverage stops before today. The start of the window is
+still exactly N days before that end date.
 """
 
 import argparse
@@ -81,7 +91,7 @@ import logging
 import random
 import sys
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 
 import requests
@@ -550,7 +560,7 @@ def write_quick_sample_csv(articles, start_time, end_time):
     return output_path
 
 
-def write_quick_sample_meta(csv_path, days, start_time, end_time, raw_count, unique_count, hit_cap):
+def write_quick_sample_meta(csv_path, days, start_time, end_time, raw_count, unique_count, hit_cap, end_date_override=None):
     if hit_cap:
         note = (
             "QUICK-SAMPLE PARTIAL DATASET: exactly one GDELT request was made for this date "
@@ -573,6 +583,7 @@ def write_quick_sample_meta(csv_path, days, start_time, end_time, raw_count, uni
         "mode": "quick_sample",
         "domain": DOMAIN,
         "requested_days": days,
+        "end_date_override": end_date_override.isoformat() if end_date_override else None,
         "start_time": start_time.isoformat(),
         "end_time": end_time.isoformat(),
         "raw_articles_returned": raw_count,
@@ -586,14 +597,23 @@ def write_quick_sample_meta(csv_path, days, start_time, end_time, raw_count, uni
     return meta_path
 
 
-def run_quick_sample(days):
-    end_time = datetime.now(timezone.utc)
+def run_quick_sample(days, end_date=None):
+    if end_date is not None:
+        end_time = datetime.combine(end_date, time(23, 59, 59), tzinfo=timezone.utc)
+        logger.info(
+            "Quick-sample mode: exactly one GDELT request for the %d day(s) ending %s (UTC), "
+            "not today",
+            days, end_date.isoformat(),
+        )
+    else:
+        end_time = datetime.now(timezone.utc)
+        logger.info(
+            "Quick-sample mode: exactly one GDELT request for the most recent %d day(s)",
+            days,
+        )
     start_time = end_time - timedelta(days=days)
 
-    logger.info(
-        "Quick-sample mode: exactly one GDELT request for the most recent %d day(s): %s to %s (UTC)",
-        days, start_time.isoformat(), end_time.isoformat(),
-    )
+    logger.info("Window: %s to %s (UTC)", start_time.isoformat(), end_time.isoformat())
 
     raw_articles = quick_sample_request(start_time, end_time)
     hit_cap = len(raw_articles) >= MAX_RECORDS_PER_REQUEST
@@ -613,6 +633,7 @@ def run_quick_sample(days):
     output_path = write_quick_sample_csv(articles, start_time, end_time)
     meta_path = write_quick_sample_meta(
         output_path, days, start_time, end_time, len(raw_articles), len(articles), hit_cap,
+        end_date_override=end_date,
     )
 
     logger.warning(
@@ -742,9 +763,27 @@ def parse_args():
             ".meta.json sidecar. Cannot be combined with --export-only."
         ),
     )
+    parser.add_argument(
+        "--end-date",
+        default=None,
+        metavar="YYYY-MM-DD",
+        help=(
+            "Quick-sample mode only: end the requested window at 23:59:59 UTC on this "
+            "historical date instead of now. The start date is still exactly N days "
+            "before it. Useful for lining up with a Ken French factor file (or other "
+            "data source) that doesn't yet cover today."
+        ),
+    )
     args = parser.parse_args()
     if args.days <= 0:
         parser.error("--days must be a positive integer")
+    if args.end_date is not None:
+        if args.quick_sample is None:
+            parser.error("--end-date is only valid together with --quick-sample")
+        try:
+            args.end_date = date.fromisoformat(args.end_date)
+        except ValueError:
+            parser.error(f"--end-date must be in YYYY-MM-DD format, got {args.end_date!r}")
     if args.quick_sample is not None:
         if args.quick_sample <= 0:
             parser.error("--quick-sample must be a positive integer")
@@ -757,7 +796,7 @@ def main():
     args = parse_args()
 
     if args.quick_sample is not None:
-        run_quick_sample(args.quick_sample)
+        run_quick_sample(args.quick_sample, end_date=args.end_date)
         return
 
     if args.export_only:
