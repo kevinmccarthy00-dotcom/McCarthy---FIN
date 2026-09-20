@@ -1,13 +1,37 @@
-"""Download the last 30 days of cnbc.com headlines from the GDELT 2.0 DOC API.
+"""Download cnbc.com headlines from the GDELT 2.0 DOC API.
 
 Usage:
-    python scripts/gdelt_cnbc_headlines.py
+    python scripts/gdelt_cnbc_headlines.py --days 30    # walkthrough mode
+    python scripts/gdelt_cnbc_headlines.py --days 365   # full assignment mode
 
 Writes a deduplicated CSV (by article URL) with columns:
 seendate, title, domain, url
 into data/gdelt/.
+
+Request strategy
+-----------------
+GDELT's DOC 2.0 API caps every response at 250 records and offers no
+cursor/offset pagination, so the only way to retrieve more than 250 articles
+for a date range is to split that range into smaller windows and query each
+one separately.
+
+Rather than requesting one day at a time (365 requests for a full year, and
+the main cause of the 429s seen in the local run), this script queries the
+*entire* requested date range in a single request first. Only if a window's
+response comes back at the 250-record cap (meaning it was truncated and
+articles may be missing) does the script split that window in half and
+re-query each half, recursing until either a window's result is under the
+cap or the window has shrunk to one hour (MIN_SPLIT_WINDOW), at which point
+it accepts what GDELT returned and logs a warning that some articles for
+that hour may be missing.
+
+This means low-news-volume periods cost a single request, and only
+genuinely high-volume periods incur the extra requests needed to page
+through them -- keeping the total request count roughly proportional to
+article volume rather than to the number of days requested.
 """
 
+import argparse
 import csv
 import logging
 import sys
@@ -19,13 +43,14 @@ import requests
 
 GDELT_DOC_API = "https://api.gdeltproject.org/api/v2/doc/doc"
 DOMAIN = "cnbc.com"
-LOOKBACK_DAYS = 30
+DEFAULT_DAYS = 30
 MAX_RECORDS_PER_REQUEST = 250
 REQUEST_TIMEOUT_SECONDS = 30
 MAX_RETRIES = 3
 RETRY_BACKOFF_SECONDS = 5
 RATE_LIMIT_BACKOFF_SECONDS = [30, 60, 120]
 DELAY_BETWEEN_REQUESTS_SECONDS = 3
+MIN_SPLIT_WINDOW = timedelta(hours=1)
 OUTPUT_DIR = Path(__file__).resolve().parent.parent / "data" / "gdelt"
 CSV_COLUMNS = ["seendate", "title", "domain", "url"]
 
@@ -37,12 +62,14 @@ logging.basicConfig(
 logger = logging.getLogger("gdelt_cnbc_headlines")
 
 
-def fetch_window(start_dt, end_dt):
-    """Fetch articles for a single time window, retrying on transient failures.
+def fetch_raw(start_dt, end_dt, stats):
+    """Issue one GDELT request for a window, retrying on transient failures.
 
-    HTTP 429 (rate limited) is retried separately from other transient
-    failures, using a longer exponential backoff and honoring the
-    Retry-After header when GDELT provides one.
+    HTTP 429 is retried separately from other transient failures, using a
+    longer exponential backoff and honoring the Retry-After header when
+    GDELT provides one. Returns the list of articles on success (which may
+    be empty), or None if the window could not be fetched after exhausting
+    retries.
     """
     params = {
         "query": f"domain:{DOMAIN}",
@@ -59,6 +86,7 @@ def fetch_window(start_dt, end_dt):
 
     while True:
         attempt += 1
+        stats["total_requests"] += 1
         try:
             response = requests.get(GDELT_DOC_API, params=params, timeout=REQUEST_TIMEOUT_SECONDS)
         except requests.exceptions.RequestException as exc:
@@ -78,7 +106,7 @@ def fetch_window(start_dt, end_dt):
                     "Giving up on window %s -> %s after %d rate-limit retries",
                     start_dt, end_dt, len(RATE_LIMIT_BACKOFF_SECONDS),
                 )
-                return []
+                return None
 
             wait_seconds = RATE_LIMIT_BACKOFF_SECONDS[rate_limit_attempt - 1]
             retry_after = response.headers.get("Retry-After")
@@ -115,50 +143,73 @@ def fetch_window(start_dt, end_dt):
         time.sleep(RETRY_BACKOFF_SECONDS * attempt)
 
     logger.error("Giving up on window %s -> %s after %d attempts", start_dt, end_dt, MAX_RETRIES)
-    return []
+    return None
 
 
-def collect_articles():
+def fetch_window_recursive(start_dt, end_dt, stats):
+    """Fetch all articles in [start_dt, end_dt), splitting the window if the
+    250-record cap was hit so no articles are silently dropped.
+    """
+    logger.info("Querying window %s -> %s", start_dt, end_dt)
+    articles = fetch_raw(start_dt, end_dt, stats)
+
+    if articles is None:
+        logger.error(
+            "Skipping window %s -> %s after repeated failures; results will be incomplete",
+            start_dt, end_dt,
+        )
+        return []
+
+    if len(articles) < MAX_RECORDS_PER_REQUEST:
+        logger.info("Window %s -> %s: retrieved %d articles", start_dt, end_dt, len(articles))
+        return articles
+
+    window_length = end_dt - start_dt
+    if window_length <= MIN_SPLIT_WINDOW:
+        logger.warning(
+            "Window %s -> %s returned the maximum %d records at the smallest allowed "
+            "granularity (%s); some articles in this window may be missing",
+            start_dt, end_dt, MAX_RECORDS_PER_REQUEST, MIN_SPLIT_WINDOW,
+        )
+        return articles
+
+    midpoint = start_dt + window_length / 2
+    stats["windows_split"] += 1
+    logger.info(
+        "Window %s -> %s hit the %d-record cap; splitting at %s and re-querying both halves",
+        start_dt, end_dt, MAX_RECORDS_PER_REQUEST, midpoint,
+    )
+
+    time.sleep(DELAY_BETWEEN_REQUESTS_SECONDS)
+    left = fetch_window_recursive(start_dt, midpoint, stats)
+    time.sleep(DELAY_BETWEEN_REQUESTS_SECONDS)
+    right = fetch_window_recursive(midpoint, end_dt, stats)
+    return left + right
+
+
+def collect_articles(days):
     end_time = datetime.now(timezone.utc)
-    start_time = end_time - timedelta(days=LOOKBACK_DAYS)
+    start_time = end_time - timedelta(days=days)
 
     logger.info(
-        "Downloading %s headlines from %s to %s (UTC)",
+        "Downloading %s headlines from %s to %s (UTC) using adaptive date-window splitting",
         DOMAIN, start_time.isoformat(), end_time.isoformat(),
     )
 
+    stats = {"total_requests": 0, "windows_split": 0}
+    raw_articles = fetch_window_recursive(start_time, end_time, stats)
+
     articles_by_url = {}
-    window_start = start_time
-    day_number = 0
-    total_days = LOOKBACK_DAYS
+    for article in raw_articles:
+        url = article.get("url")
+        if not url:
+            continue
+        articles_by_url.setdefault(url, article)
 
-    while window_start < end_time:
-        day_number += 1
-        window_end = min(window_start + timedelta(days=1), end_time)
-
-        logger.info(
-            "Day %d/%d: querying %s -> %s",
-            day_number, total_days, window_start.date(), window_end.date(),
-        )
-
-        articles = fetch_window(window_start, window_end)
-        new_count = 0
-        for article in articles:
-            url = article.get("url")
-            if not url:
-                continue
-            if url not in articles_by_url:
-                articles_by_url[url] = article
-                new_count += 1
-
-        logger.info(
-            "Day %d/%d: retrieved %d articles (%d new, %d running total)",
-            day_number, total_days, len(articles), new_count, len(articles_by_url),
-        )
-
-        window_start = window_end
-        if window_start < end_time:
-            time.sleep(DELAY_BETWEEN_REQUESTS_SECONDS)
+    logger.info(
+        "Finished: %d API request(s), %d window split(s), %d raw records, %d unique articles",
+        stats["total_requests"], stats["windows_split"], len(raw_articles), len(articles_by_url),
+    )
 
     return list(articles_by_url.values()), start_time, end_time
 
@@ -184,8 +235,28 @@ def write_csv(articles, start_time, end_time):
     return output_path
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Download cnbc.com headlines from the GDELT 2.0 DOC API.",
+    )
+    parser.add_argument(
+        "--days",
+        type=int,
+        default=DEFAULT_DAYS,
+        help=(
+            "Number of days to look back from now (e.g. 30 for a walkthrough "
+            f"run, 365 for the full assignment). Default: {DEFAULT_DAYS}."
+        ),
+    )
+    args = parser.parse_args()
+    if args.days <= 0:
+        parser.error("--days must be a positive integer")
+    return args
+
+
 def main():
-    articles, start_time, end_time = collect_articles()
+    args = parse_args()
+    articles, start_time, end_time = collect_articles(args.days)
 
     if not articles:
         logger.error("No articles collected. Exiting without writing a CSV.")
