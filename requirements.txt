@@ -1,2 +1,6 @@
 gradio
 requests
+pandas
+numpy
+matplotlib
+anthropic
