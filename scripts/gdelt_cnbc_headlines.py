@@ -8,6 +8,10 @@ Usage:
     # any new requests (useful when a run got heavily rate-limited):
     python scripts/gdelt_cnbc_headlines.py --days 30 --export-only
 
+    # Quick partial sample: exactly one GDELT request, minimal retry, for
+    # when there's no time left for the adaptive/checkpointed modes above:
+    python scripts/gdelt_cnbc_headlines.py --quick-sample 7
+
 Writes a deduplicated CSV (by article URL) with columns:
 seendate, title, domain, url
 into data/gdelt/, plus a "<csv name>.meta.json" sidecar recording whether
@@ -55,6 +59,19 @@ checkpoint -- no new requests, no fabricated or backfilled articles. The
 CSV's .meta.json sidecar records `complete: false` and the count of
 unresolved windows in that case, so downstream scripts and the final report
 can say plainly that the dataset is a partial sample.
+
+Quick-sample mode
+------------------
+`--quick-sample N` skips the adaptive/checkpointed machinery entirely: it
+makes exactly one GDELT request for the most recent N days, accepts
+whatever real records come back (even if that's the 250-record cap), and on
+a 429 retries only once after a short fixed wait before failing fast. It
+writes a CSV immediately from whatever GDELT actually returned -- never
+fabricating or filling in missing articles -- with a `.meta.json` sidecar
+that always marks the dataset as a partial "quick sample" and states plainly
+whether the 250-record cap was hit. Use it when there's no time left for a
+full adaptive run; use `--days`/`--export-only` above for a more complete
+pull.
 """
 
 import argparse
@@ -85,6 +102,8 @@ JITTER_FRACTION = 0.25
 
 DELAY_BETWEEN_REQUESTS_SECONDS = 3
 MIN_SPLIT_WINDOW = timedelta(hours=1)
+
+QUICK_SAMPLE_RETRY_WAIT_SECONDS = 15
 
 OUTPUT_DIR = Path(__file__).resolve().parent.parent / "data" / "gdelt"
 CHECKPOINT_DIR = OUTPUT_DIR / "checkpoints"
@@ -448,6 +467,170 @@ def export_only(days):
     return articles_by_url, checkpoint.start_time, checkpoint.end_time, complete, len(unresolved), None
 
 
+def quick_sample_request(start_time, end_time):
+    """Make exactly one GDELT request, retrying a 429 exactly once after a
+    short fixed wait, then failing fast. Returns the raw articles list from
+    GDELT on success. Exits the process on any failure -- no fabricated data
+    is ever produced for a quick sample.
+    """
+    params = {
+        "query": f"domain:{DOMAIN}",
+        "mode": "ArtList",
+        "format": "json",
+        "maxrecords": MAX_RECORDS_PER_REQUEST,
+        "sort": "DateDesc",
+        "startdatetime": start_time.strftime("%Y%m%d%H%M%S"),
+        "enddatetime": end_time.strftime("%Y%m%d%H%M%S"),
+    }
+
+    for attempt in (1, 2):
+        try:
+            response = requests.get(GDELT_DOC_API, params=params, timeout=REQUEST_TIMEOUT_SECONDS)
+        except requests.exceptions.RequestException as exc:
+            logger.error("Quick-sample request failed (attempt %d/2): %s", attempt, exc)
+            if attempt == 2:
+                sys.exit(1)
+            time.sleep(QUICK_SAMPLE_RETRY_WAIT_SECONDS)
+            continue
+
+        if response.status_code == 429:
+            if attempt == 2:
+                logger.error(
+                    "Quick-sample request rate-limited (429) again after one retry; "
+                    "failing fast rather than fabricating data.",
+                )
+                sys.exit(1)
+            wait_seconds = QUICK_SAMPLE_RETRY_WAIT_SECONDS
+            retry_after = response.headers.get("Retry-After")
+            if retry_after:
+                try:
+                    wait_seconds = max(wait_seconds, float(retry_after))
+                except ValueError:
+                    logger.warning("Ignoring unparseable Retry-After header: %r", retry_after)
+            logger.warning(
+                "Quick-sample request rate-limited (429); waiting %.0fs then retrying once",
+                wait_seconds,
+            )
+            time.sleep(wait_seconds)
+            continue
+
+        try:
+            response.raise_for_status()
+            payload = response.json()
+            return payload.get("articles", [])
+        except (requests.exceptions.RequestException, ValueError) as exc:
+            logger.error("Quick-sample request failed (attempt %d/2): %s", attempt, exc)
+            if attempt == 2:
+                sys.exit(1)
+            time.sleep(QUICK_SAMPLE_RETRY_WAIT_SECONDS)
+            continue
+
+    logger.error("Quick-sample request did not succeed.")
+    sys.exit(1)
+
+
+def write_quick_sample_csv(articles, start_time, end_time):
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    filename = (
+        f"cnbc_headlines_quicksample_{start_time.strftime('%Y%m%d')}_{end_time.strftime('%Y%m%d')}.csv"
+    )
+    output_path = OUTPUT_DIR / filename
+
+    with open(output_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS, extrasaction="ignore")
+        writer.writeheader()
+        for article in sorted(articles, key=lambda a: a.get("seendate", "")):
+            writer.writerow({
+                "seendate": article.get("seendate", ""),
+                "title": article.get("title", ""),
+                "domain": article.get("domain", ""),
+                "url": article.get("url", ""),
+            })
+
+    return output_path
+
+
+def write_quick_sample_meta(csv_path, days, start_time, end_time, raw_count, unique_count, hit_cap):
+    if hit_cap:
+        note = (
+            "QUICK-SAMPLE PARTIAL DATASET: exactly one GDELT request was made for this date "
+            "range. The response hit the 250-record cap, so additional real articles in this "
+            "range almost certainly exist but were not retrieved -- no further requests were "
+            "made to keep this a single quick-sample call. No articles were fabricated or "
+            "backfilled to fill the gap."
+        )
+    else:
+        note = (
+            "QUICK-SAMPLE PARTIAL DATASET: exactly one GDELT request was made for this date "
+            "range, with only one retry attempted on a rate limit. The response came in under "
+            "the 250-record cap, but because only a single request was made (no adaptive "
+            "re-querying or verification), this dataset should still be treated as a partial "
+            "sample rather than a confirmed-complete pull. No articles were fabricated or "
+            "backfilled."
+        )
+
+    meta = {
+        "mode": "quick_sample",
+        "domain": DOMAIN,
+        "requested_days": days,
+        "start_time": start_time.isoformat(),
+        "end_time": end_time.isoformat(),
+        "raw_articles_returned": raw_count,
+        "unique_articles": unique_count,
+        "hit_record_cap": hit_cap,
+        "complete": False,
+        "note": note,
+    }
+    meta_path = csv_path.with_suffix(csv_path.suffix + ".meta.json")
+    meta_path.write_text(json.dumps(meta, indent=2))
+    return meta_path
+
+
+def run_quick_sample(days):
+    end_time = datetime.now(timezone.utc)
+    start_time = end_time - timedelta(days=days)
+
+    logger.info(
+        "Quick-sample mode: exactly one GDELT request for the most recent %d day(s): %s to %s (UTC)",
+        days, start_time.isoformat(), end_time.isoformat(),
+    )
+
+    raw_articles = quick_sample_request(start_time, end_time)
+    hit_cap = len(raw_articles) >= MAX_RECORDS_PER_REQUEST
+    if hit_cap:
+        logger.warning(
+            "Quick-sample response hit the %d-record cap; real articles beyond this cap "
+            "were not retrieved (quick-sample mode makes only one request by design)",
+            MAX_RECORDS_PER_REQUEST,
+        )
+
+    articles_by_url = dedupe_by_url(raw_articles)
+    if not articles_by_url:
+        logger.error("Quick-sample returned zero articles for this date range. Exiting without writing a CSV.")
+        sys.exit(1)
+
+    articles = list(articles_by_url.values())
+    output_path = write_quick_sample_csv(articles, start_time, end_time)
+    meta_path = write_quick_sample_meta(
+        output_path, days, start_time, end_time, len(raw_articles), len(articles), hit_cap,
+    )
+
+    logger.warning(
+        "Done. Quick-sample collected %d unique article(s) (%d raw) from ONE request. This is a "
+        "PARTIAL dataset by design (%s) -- no articles were fabricated or backfilled.",
+        len(articles), len(raw_articles),
+        "the 250-record cap was hit" if hit_cap else "only a single request was made",
+    )
+    logger.info("CSV saved to: %s", output_path)
+    logger.info("Metadata saved to: %s", meta_path)
+
+    print(f"UNIQUE_ARTICLES={len(articles)}")
+    print(f"CSV_PATH={output_path}")
+    print(f"HIT_RECORD_CAP={hit_cap}")
+    print("COMPLETE=False")
+    return output_path
+
+
 def write_csv(articles, start_time, end_time):
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     filename = (
@@ -547,14 +730,35 @@ def parse_args():
             "exists yet for that --days value."
         ),
     )
+    parser.add_argument(
+        "--quick-sample",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Make exactly one GDELT request for the most recent N days and write "
+            "whatever real articles it returns to CSV immediately (a 429 is retried "
+            "only once before failing fast). Always a partial sample -- see the "
+            ".meta.json sidecar. Cannot be combined with --export-only."
+        ),
+    )
     args = parser.parse_args()
     if args.days <= 0:
         parser.error("--days must be a positive integer")
+    if args.quick_sample is not None:
+        if args.quick_sample <= 0:
+            parser.error("--quick-sample must be a positive integer")
+        if args.export_only:
+            parser.error("--quick-sample cannot be combined with --export-only")
     return args
 
 
 def main():
     args = parse_args()
+
+    if args.quick_sample is not None:
+        run_quick_sample(args.quick_sample)
+        return
 
     if args.export_only:
         articles_by_url, start_time, end_time, complete, unresolved_count, failed_count = export_only(args.days)
