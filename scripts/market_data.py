@@ -91,7 +91,11 @@ def _fetch_etf(symbol, label):
 
     try:
         ticker_obj = yf.Ticker(symbol)
-        hist = ticker_obj.history(period="3y", interval="1d", auto_adjust=True)
+        # "5y" (not "3y") because yfinance/Yahoo's chart API only accepts a
+        # fixed set of period values (1d,5d,1mo,3mo,6mo,1y,2y,5y,10y,ytd,max);
+        # "3y" isn't one of them and silently returns truncated history. "5y"
+        # gives enough headroom to compute both the 1y and 3y trailing returns.
+        hist = ticker_obj.history(period="5y", interval="1d", auto_adjust=True)
     except Exception as exc:  # noqa: BLE001
         entry["error"] = f"price history retrieval failed: {exc}"
         entry["unavailable_fields"] = [
@@ -148,9 +152,10 @@ def _fetch_yield_proxy(symbol, label):
         "raw_quote": None,
         "approx_yield_pct": None,
         "conversion_note": (
-            "Yahoo Finance quotes this index at 10x the approximate yield "
-            "percentage; approx_yield_pct = raw_quote / 10. This is a proxy, "
-            "not an exact par yield."
+            "yfinance's current data for this index reports the close price "
+            "directly in yield percent (e.g. a close of 4.25 means ~4.25%). "
+            "approx_yield_pct = raw_quote, unmodified. This is a quoted index "
+            "proxy, not an exact par yield."
         ),
         "error": None,
     }
@@ -175,7 +180,7 @@ def _fetch_yield_proxy(symbol, label):
     entry["as_of_date"] = close.index[-1].strftime("%Y-%m-%d")
     raw_quote = float(close.iloc[-1])
     entry["raw_quote"] = round(raw_quote, 4)
-    entry["approx_yield_pct"] = round(raw_quote / 10, 4)
+    entry["approx_yield_pct"] = round(raw_quote, 4)
 
     return entry
 
