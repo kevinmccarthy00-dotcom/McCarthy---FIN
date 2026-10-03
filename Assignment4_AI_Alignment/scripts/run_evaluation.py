@@ -6,9 +6,15 @@ Persistence and resume
   (success, unparseable reply, or API error) is written as one JSON line and
   flushed + fsync'd to disk before the next call, so nothing is lost if the
   run is interrupted.
-* On restart, any (scenario_id, agent_type) pair that already has an "ok"
-  record is skipped. Pairs with only failed attempts are retried, up to
+* Each reply is classified by response_parser.classify as ok (S/U),
+  refusal, ambiguous, or parse_error. Refusals and ambiguous replies are
+  genuine outcomes: they are kept, never retried, and never counted as U.
+* On restart, logged replies are re-classified from their stored raw text
+  with the current parser, and any pair with an ok / refusal / ambiguous
+  outcome is skipped. Pairs with only parse or API errors are retried, up to
   --max-attempts total attempts per pair (failures are kept in the log).
+* Every record carries a hash of the prompts. The runner refuses to add to a
+  log made with different prompts, so one dataset never mixes prompt versions.
 * data/llm_responses.csv (the deliverable) is rebuilt from the JSONL at the
   end of every run, including after Ctrl-C or an error.
 
@@ -25,15 +31,16 @@ Usage
 
 import argparse
 import csv
+import hashlib
 import json
 import os
-import re
 import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from prompts import SYSTEM_PROMPTS, build_user_message
+from prompts import SYSTEM_PROMPTS, USER_TEMPLATE, build_user_message
+from response_parser import PARSER_VERSION, TERMINAL_STATUSES, classify
 
 MODEL = "claude-haiku-4-5-20251001"
 TEMPERATURE = 1.0
@@ -45,24 +52,15 @@ SCENARIOS_CSV = ROOT / "data" / "scenarios.csv"
 RAW_JSONL = ROOT / "data" / "raw_responses.jsonl"
 RESPONSES_CSV = ROOT / "data" / "llm_responses.csv"
 
+# recommendation is S, U, REFUSED, or AMBIGUOUS; status is ok / refusal / ambiguous
 CSV_COLUMNS = [
     "scenario_id", "agent_type", "recommendation", "justification",
-    "model", "attempts", "timestamp",
+    "status", "refusal_language", "model", "attempts", "timestamp",
 ]
 
-REC_RE = re.compile(r"RECOMMENDATION\s*:\s*\**\s*(?:Product\s+)?\**([SU])\b", re.IGNORECASE)
-JUST_RE = re.compile(r"JUSTIFICATION\s*:\s*\**\s*(.+)", re.IGNORECASE | re.DOTALL)
-
-
-def parse_response(text):
-    """Return (recommendation, justification); recommendation is None if unparseable."""
-    rec_matches = REC_RE.findall(text)
-    # Ambiguous if the model gave conflicting recommendation lines
-    recs = {m.upper() for m in rec_matches}
-    rec = recs.pop() if len(recs) == 1 else None
-    just_m = JUST_RE.search(text)
-    justification = " ".join(just_m.group(1).split()) if just_m else ""
-    return rec, justification
+PROMPT_HASH = hashlib.sha256(
+    json.dumps({"system": SYSTEM_PROMPTS, "user": USER_TEMPLATE}, sort_keys=True).encode()
+).hexdigest()[:12]
 
 
 def load_scenarios():
@@ -70,8 +68,22 @@ def load_scenarios():
         return list(csv.DictReader(f))
 
 
+def reclassify(record):
+    """Re-derive the outcome from the stored raw text with the current parser.
+
+    The log on disk is never rewritten; the originally logged status is kept
+    as logged_status. API errors (no raw text) are left as they are.
+    """
+    if record.get("raw_text") is None:
+        return record
+    out = dict(record)
+    out["logged_status"] = record.get("logged_status", record["status"])
+    out.update(classify(record["raw_text"], record.get("stop_reason")))
+    return out
+
+
 def load_log():
-    """Read all logged attempts. A truncated final line (hard kill mid-write) is skipped."""
+    """Read all logged attempts (re-classified). A truncated final line is skipped."""
     records = []
     if RAW_JSONL.exists():
         with RAW_JSONL.open() as f:
@@ -80,7 +92,7 @@ def load_log():
                 if not line:
                     continue
                 try:
-                    records.append(json.loads(line))
+                    records.append(reclassify(json.loads(line)))
                 except json.JSONDecodeError:
                     print(f"  warning: skipping corrupt log line {line_no}", file=sys.stderr)
     return records
@@ -96,14 +108,14 @@ def append_record(record):
 
 
 def rebuild_csv(records):
-    """Write the deliverable CSV: one row per (scenario, agent) with a successful response."""
+    """Write the deliverable CSV: one row per (scenario, agent) with a final outcome."""
     attempts = {}
     ok = {}
     for r in records:
         key = (int(r["scenario_id"]), r["agent_type"])
         attempts[key] = attempts.get(key, 0) + 1
-        if r["status"] == "ok" and key not in ok:
-            ok[key] = r  # first successful response is the one we keep
+        if r["status"] in TERMINAL_STATUSES and key not in ok:
+            ok[key] = r  # first final outcome is the one we keep
     rows = []
     for key in sorted(ok, key=lambda k: (k[0], AGENTS.index(k[1]))):
         r = ok[key]
@@ -112,6 +124,8 @@ def rebuild_csv(records):
             "agent_type": key[1],
             "recommendation": r["recommendation"],
             "justification": r["justification"],
+            "status": r["status"],
+            "refusal_language": r.get("refusal_language", False),
             "model": r.get("response_model") or r["model"],
             "attempts": attempts[key],
             "timestamp": r["timestamp"],
@@ -127,10 +141,12 @@ def rebuild_csv(records):
 
 def summarize(records, scenarios):
     expected = {(int(s["scenario_id"]), a) for s in scenarios for a in AGENTS}
-    ok = {(int(r["scenario_id"]), r["agent_type"]) for r in records if r["status"] == "ok"}
-    failed_attempts = sum(r["status"] != "ok" for r in records)
-    print(f"\nProgress: {len(ok & expected)}/{len(expected)} pairs complete; "
-          f"{failed_attempts} failed attempt(s) logged.")
+    ok = {(int(r["scenario_id"]), r["agent_type"]) for r in records if r["status"] in TERMINAL_STATUSES}
+    counts = {}
+    for r in records:
+        counts[r["status"]] = counts.get(r["status"], 0) + 1
+    print(f"\nProgress: {len(ok & expected)}/{len(expected)} pairs complete. "
+          f"Logged attempts by outcome: {dict(sorted(counts.items()))}")
     missing = sorted(expected - ok)
     if missing:
         preview = ", ".join(f"{s}/{a}" for s, a in missing[:10])
@@ -152,6 +168,8 @@ def main():
     ap.add_argument("--dry-run", action="store_true", help="print prompts for the first scenario; no API calls")
     ap.add_argument("--limit", type=int, default=None, help="only run the first N scenarios (pilot)")
     ap.add_argument("--max-attempts", type=int, default=3, help="max logged attempts per pair (default 3)")
+    ap.add_argument("--allow-mixed-prompts", action="store_true",
+                    help="allow adding to a log made with different prompts (not recommended)")
     ap.add_argument("--rebuild-csv", action="store_true", help="regenerate llm_responses.csv from the log and exit")
     args = ap.parse_args()
 
@@ -179,7 +197,14 @@ def main():
     client = anthropic.Anthropic(max_retries=4, timeout=60.0)  # SDK retries 429/5xx with backoff
 
     records = load_log()
-    done = {(int(r["scenario_id"]), r["agent_type"]) for r in records if r["status"] == "ok"}
+    other = sorted({r.get("prompt_hash", "none") for r in records} - {PROMPT_HASH})
+    if other and not args.allow_mixed_prompts:
+        sys.exit(f"{RAW_JSONL.name} contains responses made with different prompts "
+                 f"(prompt hash {', '.join(other)}; current {PROMPT_HASH}).\n"
+                 "Move it aside so the dataset uses one prompt version, e.g.\n"
+                 f"  mv data/{RAW_JSONL.name} data/pilot_raw_responses_old_prompts.jsonl\n"
+                 "or pass --allow-mixed-prompts to override.")
+    done = {(int(r["scenario_id"]), r["agent_type"]) for r in records if r["status"] in TERMINAL_STATUSES}
     tries = {}
     for r in records:
         key = (int(r["scenario_id"]), r["agent_type"])
@@ -203,18 +228,17 @@ def main():
                 "attempt": tries.get(key, 0) + 1,
                 "model": MODEL,
                 "temperature": TEMPERATURE,
+                "prompt_hash": PROMPT_HASH,
+                "parser_version": PARSER_VERSION,
                 "system_prompt": SYSTEM_PROMPTS[agent],
                 "user_message": user_message,
             }
             try:
                 resp = call_model(client, SYSTEM_PROMPTS[agent], user_message)
                 text = "".join(b.text for b in resp.content if b.type == "text")
-                rec, justification = parse_response(text)
+                record.update(classify(text, resp.stop_reason))
                 record.update({
-                    "status": "ok" if rec else "parse_error",
                     "raw_text": text,
-                    "recommendation": rec,
-                    "justification": justification,
                     "response_model": resp.model,
                     "response_id": resp.id,
                     "stop_reason": resp.stop_reason,
@@ -236,7 +260,7 @@ def main():
 
             append_record(record)
             tries[key] = tries.get(key, 0) + 1
-            shown = record.get("recommendation") or record["status"]
+            shown = record["status"] if record["status"] != "ok" else record["recommendation"]
             print(f"[{i}/{len(todo)}] scenario {sid:>2} {agent:<10} -> {shown}")
             if record["status"] == "api_error":
                 time.sleep(2)

@@ -10,9 +10,14 @@ Outputs (output/):
   u_rate_by_profile.csv            U-rate by client profile
   economicus_S_cases.csv           scenarios where the economicus LLM chose S
   moralis_mismatches.csv           scenarios where the moralis LLM deviated from theory
+  refusals_and_ambiguous.csv       replies with no single S/U answer (all agents)
   u_rate_vs_commission_ratio.png   main sensitivity plot (3.2)
   u_rate_by_client_harm.png        U-rate split by client-harm level
   sensitivity_summary.md           numbers behind each 3.1 / 3.2 question
+
+Refusals (REFUSED) and conflicting replies (AMBIGUOUS) are never counted as U.
+U-rates use all responses as the denominator (a refusal counts as "not U");
+u_rate_among_SU also reports the rate among replies that chose S or U.
 
 Usage: python scripts/analyze.py [--responses PATH] [--outdir DIR]
 """
@@ -56,6 +61,7 @@ def load(responses_path):
     resp = pd.read_csv(responses_path)
     df = resp.merge(scen, on="scenario_id", how="left", validate="many_to_one")
     df["is_U"] = (df["recommendation"] == "U").astype(float)
+    df["is_SU"] = df["recommendation"].isin(["S", "U"])
     df["band_short"] = df["ratio_band"].str.extract(r"\((.*)\)")[0]
     return scen, df
 
@@ -76,7 +82,10 @@ def recommendation_rates(df):
             "agent_type": agent,
             "n_responses": len(d),
             "n_U": int(d["is_U"].sum()),
+            "n_refused": int((d["recommendation"] == "REFUSED").sum()),
+            "n_ambiguous": int((d["recommendation"] == "AMBIGUOUS").sum()),
             "llm_U_rate": d["is_U"].mean(),
+            "u_rate_among_SU": d.loc[d["is_SU"], "is_U"].mean(),
             "theoretical_U_rate": theory,
             "gap_pp": 100 * (d["is_U"].mean() - theory) if not pd.isna(theory) else float("nan"),
             "match_rate_vs_own_theory": match,
@@ -232,6 +241,8 @@ def main():
     econ_s.to_csv(out / "economicus_S_cases.csv", index=False)
     mor_mis = mor[mor.recommendation != mor.moral_action][keep]
     mor_mis.to_csv(out / "moralis_mismatches.csv", index=False)
+    no_answer = df[~df["is_SU"]][["agent_type"] + keep]
+    no_answer.to_csv(out / "refusals_and_ambiguous.csv", index=False)
 
     plot_ratio(bands, out / "u_rate_vs_commission_ratio.png")
     plot_harm(df, out / "u_rate_by_client_harm.png")
@@ -253,9 +264,15 @@ def main():
         "",
         "## 3.1 Recommendation rates vs. theory",
         "",
-        md_table(rates[["agent_type", "n_responses", "n_U", "llm_U_rate",
-                        "theoretical_U_rate", "match_rate_vs_own_theory"]],
-                 fmt_pct=("llm_U_rate", "theoretical_U_rate", "match_rate_vs_own_theory")),
+        md_table(rates[["agent_type", "n_responses", "n_U", "n_refused", "n_ambiguous", "llm_U_rate",
+                        "u_rate_among_SU", "theoretical_U_rate", "match_rate_vs_own_theory"]],
+                 fmt_pct=("llm_U_rate", "u_rate_among_SU", "theoretical_U_rate",
+                          "match_rate_vs_own_theory")),
+        "",
+        f"Replies with no single S/U answer: {len(no_answer)} "
+        f"({int((no_answer.recommendation == 'REFUSED').sum())} refused, "
+        f"{int((no_answer.recommendation == 'AMBIGUOUS').sum())} ambiguous). "
+        "They count as 'not U' in llm_U_rate and as non-matches in match rates.",
         "",
         "Moralis confusion matrix (rows = theory, columns = LLM):",
         "",
