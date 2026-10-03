@@ -1,30 +1,11 @@
-# Alignment Assessment
+### Alignment Assessment
 
-*Claude Haiku 4.5, temperature 1, one response per scenario, 50 scenarios x 3 prompts (prompt version `ff6d8cff4df1`).*
+The biggest takeaway from this experiment was that system prompts can meaningfully influence an LLM's behavior, but that doesn't necessarily mean the model will follow the intended decision framework.
 
-**How the prompts shifted behavior.** With no alignment instructions, the model behaved like
-a careful fiduciary: the baseline recommended the suitable product (S) in all 50 meetings.
-The Homo economicus prompt reversed this almost completely, recommending the unsuitable
-product (U) in 49 of 50 meetings (98% against a theoretical 100%) with one refusal. The Homo
-moralis prompt produced no shift at all. It chose S in all 50 meetings, identical to the
-baseline every time.
+The baseline recommended the suitable product in all 50 scenarios, suggesting the model already had a strong preference toward protecting the client. Introducing the Homo Economicus prompt created a significant shift, with the model recommending the unsuitable product 49 times and refusing once. This was a 98% match to the theoretical prediction.
 
-**Where alignment succeeded and failed.** Steering toward self-interest worked even though it
-harmed clients. The single refusal (scenario 37) involved a retiree on a fixed income losing
-$6,800 a year in gains for a $200 commission difference. One case is not a pattern, but it
-suggests the model's own safeguards rarely overrode the prompt. The Kantian prompt failed:
-it matched theory in only 40% of meetings, covering all 20 cases where the formula favors S
-and none of the 30 where it favors U.
+Homo Moralis was where things got more interesting. Despite being given a specific utility formula, it recommended the suitable product in all 50 scenarios, matching theory only 40% of the time. What stood out to me was that the model often calculated both utilities correctly and even acknowledged when Product U had the higher value. However, it ultimately disregarded that calculation in favor of protecting the client and preserving trust in the advisory industry. Even as the commission incentive increased, its recommendation never changed.
 
-**No sensitivity to the commission ratio.** Theory says the moral agent should switch to U
-once C_u/C_s exceeds about 1.67. The model never did. Its U-rate stayed at 0% in every band,
-even at ratios of 3 to 4. It appears to have followed the prompt's ethical framing rather
-than its arithmetic; the justifications would show whether it skipped the calculation or
-overrode it.
+To me, this highlights an important distinction between an AI model making what appears to be the right ethical decision and actually following the framework it was instructed to use. While the outcome of the moral agent was arguably better for clients, it was still a failure of alignment against the defined objective.
 
-**Implications for financial advising.** A system prompt is a strong but uneven control. It
-easily pushed the model toward a harmful goal, yet could not make it apply a precise rule
-that conflicted with its client-first default. Firms should not assume a written policy is
-followed as written: key decision rules belong in tested code, with human oversight and
-monitoring. With one model, one prompt wording and one response per scenario, these results
-show what can happen, not what always will.
+In a financial advising environment, that inconsistency matters. Prompting can influence behavior, but I wouldn't rely on it alone for decisions that require adherence to specific rules. Pairing LLMs with defined calculations, validation checks, and human oversight seems like a more reliable approach.
