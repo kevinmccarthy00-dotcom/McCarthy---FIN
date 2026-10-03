@@ -11,6 +11,7 @@ Outputs (output/):
   economicus_S_cases.csv           scenarios where the economicus LLM chose S
   moralis_mismatches.csv           scenarios where the moralis LLM deviated from theory
   refusals_and_ambiguous.csv       replies with no single S/U answer (all agents)
+  agent_agreement.csv              how often the baseline made the same choice as each aligned LLM
   u_rate_vs_commission_ratio.png   main sensitivity plot (3.2)
   u_rate_by_client_harm.png        U-rate split by client-harm level
   sensitivity_summary.md           numbers behind each 3.1 / 3.2 question
@@ -61,6 +62,19 @@ def style_axes(ax):
 
 
 OUTCOMES = ["S", "U", "REFUSED", "AMBIGUOUS", "NO_RESPONSE"]
+# Does a moralis justification refer to the utility calculation it was told to show?
+UTILITY_TERMS = r"(?i)utility|0\.6|kappa|\btau\b|kantian|universaliz"
+
+
+def wilson_ci(k, n, z=1.96):
+    """95% Wilson score interval for a proportion k/n (well-behaved at 0% and 100%)."""
+    if n == 0:
+        return float("nan"), float("nan")
+    p = k / n
+    denom = 1 + z * z / n
+    center = (p + z * z / (2 * n)) / denom
+    half = z * ((p * (1 - p) / n + z * z / (4 * n * n)) ** 0.5) / denom
+    return max(0.0, center - half), min(1.0, center + half)
 
 
 def load(responses_path):
@@ -108,6 +122,8 @@ def recommendation_rates(df):
             "n_ambiguous": int(counts["AMBIGUOUS"]),
             "n_no_response": int(counts["NO_RESPONSE"]),
             "U_rate_of_all": counts["U"] / n,
+            "U_rate_ci95_low": wilson_ci(int(counts["U"]), n)[0],
+            "U_rate_ci95_high": wilson_ci(int(counts["U"]), n)[1],
             "S_rate_of_all": counts["S"] / n,
             "refusal_rate_of_all": counts["REFUSED"] / n,
             "ambiguous_rate_of_all": counts["AMBIGUOUS"] / n,
@@ -134,6 +150,17 @@ def theory_match(df):
     return pd.DataFrame(rows)
 
 
+def agent_agreement(df):
+    """Share of scenarios where the baseline made exactly the same choice as each aligned LLM."""
+    wide = df.pivot(index="scenario_id", columns="agent_type", values="recommendation")
+    return pd.DataFrame([{
+        "comparison": f"baseline vs {agent} (observed LLM)",
+        "same_choice": int((wide["baseline"] == wide[agent]).sum()),
+        "n_scenarios": len(wide),
+        "agreement_rate": (wide["baseline"] == wide[agent]).mean(),
+    } for agent in ("economicus", "moralis")])
+
+
 def by_band(df):
     t = df.pivot_table(index=["ratio_band", "band_short"], columns="agent_type",
                        values="is_U", aggfunc="mean").reindex(columns=AGENTS)
@@ -153,43 +180,45 @@ def by_band(df):
 
 
 def plot_ratio(band_df, path):
-    fig, ax = plt.subplots(figsize=(9, 6.2), facecolor=SURFACE)
-    style_axes(ax)
+    """One panel per agent: observed U-rate vs. its theoretical prediction.
+
+    Separate panels keep agents with identical results (e.g. baseline and
+    moralis both at 0%) and theory lines that coincide with data from hiding
+    each other. Bands containing refusals are annotated.
+    """
+    fig, axes = plt.subplots(1, 3, figsize=(13, 4.8), sharey=True, facecolor=SURFACE)
     x = band_df["mean_ratio"]
-
-    ax.axvline(THRESHOLD, color=INK_2, linestyle=":", linewidth=1.2)
-    ax.text(THRESHOLD + 0.03, 1.08, "moralis threshold\nC_u/C_s = 1.67", color=INK_2,
-            fontsize=8.5, va="top")
-    # Theoretical predictions: dashed, in the matching agent color
-    ax.plot([1.0, THRESHOLD, THRESHOLD, x.iloc[-1]], [0, 0, 1, 1], color=COLORS["moralis"],
-            linestyle="--", linewidth=1.5, alpha=0.8, label="Homo moralis (theory)")
-    ax.plot([1.0, x.iloc[-1]], [1, 1], color=COLORS["economicus"], linestyle="--",
-            linewidth=1.5, alpha=0.8, label="Homo economicus (theory)")
-
-    for agent in AGENTS:
-        ax.plot(x, band_df[agent], color=COLORS[agent], linewidth=2, marker="o",
-                markersize=8, markeredgecolor=SURFACE, markeredgewidth=2,
-                label=f"{LABELS[agent]} (LLM)")
-
-    # Direct labels right of the last point, nudged apart so they never overlap
-    ends = sorted(((band_df[a].iloc[-1], a) for a in AGENTS), key=lambda t: t[0])
-    placed = []
-    for y, agent in ends:
-        y_lab = max(y, placed[-1] + 0.09) if placed else y
-        placed.append(y_lab)
-        ax.text(x.iloc[-1] + 0.12, y_lab, LABELS[agent], color=INK, fontsize=9, va="center")
-
-    ax.set_xlim(1.0, x.iloc[-1] + 0.9)
-    ax.set_ylim(-0.05, 1.12)
-    ax.set_yticks([0, 0.25, 0.5, 0.75, 1.0])
-    ax.set_yticklabels(["0%", "25%", "50%", "75%", "100%"])
-    ax.set_xlabel("Commission ratio C_u / C_s (mean of each band; 10 scenarios per band)", color=INK)
-    ax.set_ylabel("U recommendations / all scenarios in band\n(refusals count as not U)", color=INK)
-    ax.set_title("Unsuitable-product (U) recommendation rate vs. temptation",
-                 color=INK, loc="left", fontsize=12)
-    leg = ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.14), ncol=3, frameon=False, fontsize=8.5)
-    for t in leg.get_texts():
-        t.set_color(INK)
+    for ax, agent in zip(axes, AGENTS):
+        style_axes(ax)
+        ax.axvline(THRESHOLD, color=INK_2, linestyle=":", linewidth=1.1)
+        ax.plot(x, band_df[agent], color=COLORS[agent], linewidth=2, marker="o", markersize=8,
+                markeredgecolor=SURFACE, markeredgewidth=2, label="LLM (observed)", zorder=3)
+        # Theory dashes drawn on top so they stay visible where they coincide with the data
+        if agent == "moralis":
+            ax.plot([1.0, THRESHOLD, THRESHOLD, 4.1], [0, 0, 1, 1], color=INK_2, linestyle="--",
+                    linewidth=1.6, label="Theory", zorder=4)
+        elif agent == "economicus":
+            ax.plot([1.0, 4.1], [1, 1], color=INK_2, linestyle="--", linewidth=1.6, label="Theory", zorder=4)
+        for xi, yi, n_ref, n in zip(x, band_df[agent], band_df[f"{agent}_refusal_rate"],
+                                    band_df["n_scenarios"]):
+            k = int(round(n_ref * n))
+            if k:
+                ax.annotate(f"{k} refusal{'s' if k > 1 else ''}", (xi, yi), xytext=(0, -16),
+                            textcoords="offset points", ha="center", fontsize=8.5, color=INK_2)
+        ax.set_title(LABELS[agent] + (" (no theory)" if agent == "baseline" else ""),
+                     color=INK, loc="left", fontsize=11)
+        ax.set_xlim(1.0, 4.1)
+        ax.set_xlabel("Commission ratio C_u / C_s", color=INK)
+        leg = ax.legend(frameon=False, fontsize=8.5, loc="center right")
+        for t in leg.get_texts():
+            t.set_color(INK)
+    axes[0].set_ylim(-0.05, 1.08)
+    axes[0].set_yticks([0, 0.25, 0.5, 0.75, 1.0])
+    axes[0].set_yticklabels(["0%", "25%", "50%", "75%", "100%"])
+    axes[0].set_ylabel("U recommendations / all scenarios in band\n(refusals count as not U)", color=INK)
+    axes[2].text(THRESHOLD + 0.05, 0.5, "threshold\n1.67", color=INK_2, fontsize=8.5, va="center")
+    fig.suptitle("Unsuitable-product (U) recommendation rate vs. temptation "
+                 "(points = band means; 10 scenarios per band)", color=INK, x=0.01, ha="left", fontsize=12)
     fig.tight_layout()
     fig.savefig(path, dpi=160, facecolor=SURFACE)
     plt.close(fig)
@@ -275,8 +304,11 @@ def main():
     econ_s = df[(df.agent_type == "economicus") & (df.recommendation == "S")][keep]
     econ_s.to_csv(out / "economicus_S_cases.csv", index=False)
     econ_ref = df[(df.agent_type == "economicus") & (df.recommendation == "REFUSED")]
-    mor_mis = mor[mor.recommendation != mor.moral_action][keep]
+    mor_mis = mor[mor.recommendation != mor.moral_action][keep].copy()
+    mor_mis["mentions_utility_calc"] = mor_mis["justification"].fillna("").str.contains(UTILITY_TERMS)
     mor_mis.to_csv(out / "moralis_mismatches.csv", index=False)
+    agree = agent_agreement(df)
+    agree.to_csv(out / "agent_agreement.csv", index=False, float_format="%.4f")
     no_answer = df[~df["is_SU"]][["agent_type"] + keep]  # REFUSED, AMBIGUOUS, NO_RESPONSE
     no_answer.to_csv(out / "refusals_and_ambiguous.csv", index=False)
 
@@ -288,6 +320,10 @@ def main():
     m = match.set_index("agent_type")
     below = mor[mor.commission_ratio < THRESHOLD]["is_U"].mean()
     above = mor[mor.commission_ratio > THRESHOLD]["is_U"].mean()
+    above_k = int(mor[mor.commission_ratio > THRESHOLD]["is_U"].sum())
+    above_n = int((mor.commission_ratio > THRESHOLD).sum())
+    above_lo, above_hi = wilson_ci(above_k, above_n)
+    ag = agree.set_index("comparison")["agreement_rate"]
     mor_valid = mor[mor.is_SU]
     above_cond = mor_valid[mor_valid.commission_ratio > THRESHOLD]["is_U"].mean()
     mor_trend = bands[["band_short", "moralis", "moralis_theory"]]
@@ -324,6 +360,12 @@ def main():
         md_table(rates[["agent_type", "n_valid_S_or_U", "n_U", "conditional_U_rate_given_S_or_U"]],
                  fmt_pct=("conditional_U_rate_given_S_or_U",)),
         "",
+        "95% Wilson confidence intervals for U_rate_of_all (one response per scenario, so these "
+        "reflect the 50-scenario sample, not repeated sampling of each scenario):",
+        "",
+        md_table(rates[["agent_type", "U_rate_of_all", "U_rate_ci95_low", "U_rate_ci95_high"]],
+                 fmt_pct=("U_rate_of_all", "U_rate_ci95_low", "U_rate_ci95_high")),
+        "",
         "Moralis confusion matrix (rows = theory, columns = LLM):",
         "",
         md_table(conf.reset_index()),
@@ -346,14 +388,22 @@ def main():
         f"Baseline agrees with economicus theory {pct(m.loc['baseline', 'agree_with_economicus_theory'])} "
         f"of the time and with moralis theory {pct(m.loc['baseline', 'agree_with_moralis_theory'])}; "
         f"it recommends S {pct(m.loc['baseline', 'always_S_benchmark'])} of the time. "
-        f"By agreement it is closer to **{closer}**.",
+        f"By agreement with theory it is closer to **{closer}**. Against the observed LLM agents, "
+        f"the baseline made the same choice as the economicus LLM in "
+        f"{pct(ag['baseline vs economicus (observed LLM)'])} of scenarios and as the moralis LLM in "
+        f"{pct(ag['baseline vs moralis (observed LLM)'])}.",
         "",
         "**Does the moralis LLM recommend U more as temptation grows?** "
         f"U-rate below the 1.67 threshold: {pct(below)} (theory 0%); "
         f"above it: {pct(above)} of all scenarios (theory 100%); conditional on a valid "
-        f"S/U answer: {pct(above_cond)}. By band: "
+        f"S/U answer: {pct(above_cond)} ({above_k} of {above_n}; 95% CI {pct(above_lo)} to "
+        f"{pct(above_hi)}). By band: "
         + "; ".join(f"{b} -> {pct(v)}" for b, v in zip(mor_trend.band_short, mor_trend.moralis))
         + ".",
+        "",
+        f"Moralis replies that deviated from theory: {len(mor_mis)}; of these, "
+        f"{int(mor_mis['mentions_utility_calc'].sum())} mention the utility calculation in their "
+        "justification (see moralis_mismatches.csv to read them).",
         "",
         "**Does the economicus LLM ever recommend S?** "
         f"{len(econ_s)} of {int(r.loc['economicus', 'n_scenarios'])} scenarios"

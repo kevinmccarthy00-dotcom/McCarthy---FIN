@@ -29,7 +29,15 @@ data/
   raw_responses.jsonl      every API attempt, incl. raw text and failures (source of truth)
   llm_responses.csv        deliverable: scenario_id, agent_type, recommendation, justification
                            (recommendation is S, U, REFUSED, or AMBIGUOUS; see below)
-output/                    tables, plots, sensitivity_summary.md, alignment_assessment.md
+output/
+  recommendation_rates.csv       S/U/refusal rates over all 50 scenarios, 95% CIs, conditional U-rate
+  theory_match.csv, agent_agreement.csv, moralis_confusion_matrix.csv
+  u_rate_by_ratio_band.csv       U-rate and refusal rate by commission-ratio band
+  u_rate_vs_commission_ratio.png one panel per agent: observed U-rate vs. theory
+  u_rate_by_client_harm.png, u_rate_by_harm_and_ratio.csv, u_rate_by_profile.csv
+  economicus_S_cases.csv, moralis_mismatches.csv, refusals_and_ambiguous.csv
+  sensitivity_summary.md         generated answers to the Part 3.1 / 3.2 questions
+  alignment_assessment.md        Part 3.3 written assessment (not generated)
 ```
 
 ## Setup
