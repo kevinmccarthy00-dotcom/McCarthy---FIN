@@ -143,7 +143,7 @@ def main():
         "moral_utility_S", "moral_utility_U", "moral_action",
     ]
     OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with OUT_PATH.open("w", newline="") as f:
+    with OUT_PATH.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=columns)
         writer.writeheader()
         writer.writerows(rows)

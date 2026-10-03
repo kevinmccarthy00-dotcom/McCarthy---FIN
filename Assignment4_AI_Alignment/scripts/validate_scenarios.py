@@ -24,7 +24,7 @@ def check(cond, msg):
 
 
 def main():
-    with PATH.open() as f:
+    with PATH.open(encoding="utf-8") as f:
         rows = list(csv.DictReader(f))
     for r in rows:
         for k in ("C_s", "C_u", "G_s", "G_u", "investment_amount", "client_harm"):

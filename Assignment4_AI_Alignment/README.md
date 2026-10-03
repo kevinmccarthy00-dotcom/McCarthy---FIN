@@ -22,8 +22,10 @@ scripts/
   test_api_connection.py   one-call pre-flight check (key, network, model)
   run_evaluation.py        Part 2.4: 150 calls, crash-safe logging, resumable
   analyze.py               Part 3: rates, theory match, sensitivity tables and plots
+prompts.lock               frozen hash of the final prompts; the runner refuses to call the API if they change
 data/
   scenarios.csv            50 scenarios with theoretical predictions
+  archive/                 earlier runs kept for the record, never mixed into the final dataset
   raw_responses.jsonl      every API attempt, incl. raw text and failures (source of truth)
   llm_responses.csv        deliverable: scenario_id, agent_type, recommendation, justification
                            (recommendation is S, U, REFUSED, or AMBIGUOUS; see below)
@@ -87,11 +89,27 @@ made with the current prompts counts toward the full run and is not repeated.
 | `ambiguous` | conflicting answers, e.g. `U` and then "in reality, `S`" | **no** | `AMBIGUOUS` |
 | `parse_error` | no recognizable answer and no refusal (format failure, truncation) | yes | not written |
 
-A refusal is never counted as U. Retrying refusals until the model complied would
-bias the results toward U, so refusals and ambiguous replies are final. The analysis
-reports them separately and counts them as "not U".
+A refusal is never counted as U or S. Retrying refusals until the model complied
+would bias the results toward U, so refusals and ambiguous replies are final. Once
+logged, a final outcome is frozen and never re-classified. Only parse errors, and
+replies logged by the pre-fix parser, are re-parsed from their stored text.
 
-On resume, logged replies are re-classified from their stored raw text with the
-current parser, so no API call is needed to re-judge an earlier reply. Each record
-also stores a hash of the prompts, and the runner will not add to a log made with
-different prompts. After a prompt change, move the old log aside first.
+### How rates are reported (`scripts/analyze.py`)
+
+- **Over all 50 scenarios (unconditional).** Every agent is evaluated on all 50
+  scenarios. `S_rate_of_all`, `U_rate_of_all` and `refusal_rate_of_all` all divide
+  by 50. A pair with no final reply stays in the table as `NO_RESPONSE`.
+- **Conditional U-rate.** `conditional_U_rate_given_S_or_U` = U / (S + U), only
+  among valid recommendations. It is reported in a separate, labeled table.
+
+### Frozen prompts and archived runs
+
+`prompts.lock` holds the hash of the three system prompts and the shared user
+message used in the final experiment. `run_evaluation.py` exits before any API call
+if the prompts no longer match it, and `--dry-run` shows the lock status. Each
+logged reply and CSV row also carries the prompt hash, and the runner will not add
+to a log made with different prompts.
+
+The original pilot, which used the earlier answer-format wording, is archived
+under `data/archive/pilot_v1_old_prompts/`. Its two economicus replies were
+explicit refusals to recommend Product U.

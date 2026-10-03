@@ -9,12 +9,16 @@ Persistence and resume
 * Each reply is classified by response_parser.classify as ok (S/U),
   refusal, ambiguous, or parse_error. Refusals and ambiguous replies are
   genuine outcomes: they are kept, never retried, and never counted as U.
-* On restart, logged replies are re-classified from their stored raw text
-  with the current parser, and any pair with an ok / refusal / ambiguous
+* A logged final outcome (ok / refusal / ambiguous) is frozen: it is never
+  re-classified, so a refusal can never later become S or U. Only replies
+  logged as parse errors, or by the pre-fix parser (no parser_version), are
+  re-parsed from their stored raw text on restart. Any pair with a final
   outcome is skipped. Pairs with only parse or API errors are retried, up to
   --max-attempts total attempts per pair (failures are kept in the log).
 * Every record carries a hash of the prompts. The runner refuses to add to a
-  log made with different prompts, so one dataset never mixes prompt versions.
+  log made with different prompts, so one dataset never mixes prompt versions,
+  and refuses to call the API at all if the prompts no longer match the frozen
+  hash in prompts.lock (the final experiment's prompts).
 * data/llm_responses.csv (the deliverable) is rebuilt from the JSONL at the
   end of every run, including after Ctrl-C or an error.
 
@@ -55,26 +59,43 @@ RESPONSES_CSV = ROOT / "data" / "llm_responses.csv"
 # recommendation is S, U, REFUSED, or AMBIGUOUS; status is ok / refusal / ambiguous
 CSV_COLUMNS = [
     "scenario_id", "agent_type", "recommendation", "justification",
-    "status", "refusal_language", "model", "attempts", "timestamp",
+    "status", "refusal_language", "prompt_hash", "model", "attempts", "timestamp",
 ]
 
 PROMPT_HASH = hashlib.sha256(
     json.dumps({"system": SYSTEM_PROMPTS, "user": USER_TEMPLATE}, sort_keys=True).encode()
 ).hexdigest()[:12]
+PROMPT_LOCK = ROOT / "prompts.lock"
+
+
+def check_prompt_lock():
+    """Return an error message if the prompts differ from the frozen hash, else None."""
+    if not PROMPT_LOCK.exists():
+        return f"{PROMPT_LOCK.name} is missing; the prompts are not frozen."
+    locked = PROMPT_LOCK.read_text(encoding="utf-8").strip()
+    if locked != PROMPT_HASH:
+        return (f"Prompts changed: current hash {PROMPT_HASH} != frozen hash {locked} in "
+                f"{PROMPT_LOCK.name}. The final experiment must use the frozen prompts.")
+    return None
 
 
 def load_scenarios():
-    with SCENARIOS_CSV.open() as f:
+    with SCENARIOS_CSV.open(encoding="utf-8") as f:
         return list(csv.DictReader(f))
 
 
 def reclassify(record):
-    """Re-derive the outcome from the stored raw text with the current parser.
+    """Re-parse a logged reply only if it has no final outcome yet.
 
-    The log on disk is never rewritten; the originally logged status is kept
-    as logged_status. API errors (no raw text) are left as they are.
+    Final outcomes logged by this parser (ok / refusal / ambiguous) are frozen,
+    so a recorded refusal is never turned into S or U. Parse errors and records
+    from the pre-fix parser (no parser_version) are re-parsed from their raw
+    text. The log on disk is never rewritten; the logged status is kept as
+    logged_status. API errors (no raw text) are left as they are.
     """
     if record.get("raw_text") is None:
+        return record
+    if record.get("parser_version") is not None and record["status"] in TERMINAL_STATUSES:
         return record
     out = dict(record)
     out["logged_status"] = record.get("logged_status", record["status"])
@@ -86,7 +107,7 @@ def load_log():
     """Read all logged attempts (re-classified). A truncated final line is skipped."""
     records = []
     if RAW_JSONL.exists():
-        with RAW_JSONL.open() as f:
+        with RAW_JSONL.open(encoding="utf-8") as f:
             for line_no, line in enumerate(f, start=1):
                 line = line.strip()
                 if not line:
@@ -101,8 +122,9 @@ def load_log():
 def append_record(record):
     """Append one record and force it to disk before returning."""
     RAW_JSONL.parent.mkdir(parents=True, exist_ok=True)
-    with RAW_JSONL.open("a") as f:
-        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    # ASCII-only JSON (non-ASCII characters escaped) so the file is identical on every OS
+    with RAW_JSONL.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=True) + "\n")
         f.flush()
         os.fsync(f.fileno())
 
@@ -126,16 +148,22 @@ def rebuild_csv(records):
             "justification": r["justification"],
             "status": r["status"],
             "refusal_language": r.get("refusal_language", False),
+            "prompt_hash": r.get("prompt_hash", ""),
             "model": r.get("response_model") or r["model"],
             "attempts": attempts[key],
             "timestamp": r["timestamp"],
         })
     tmp = RESPONSES_CSV.with_suffix(".csv.tmp")
-    with tmp.open("w", newline="") as f:
+    with tmp.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
         writer.writeheader()
         writer.writerows(rows)
-    tmp.replace(RESPONSES_CSV)  # atomic swap: the CSV is never half-written
+    try:
+        tmp.replace(RESPONSES_CSV)  # atomic swap: the CSV is never half-written
+    except PermissionError:
+        # Windows: the CSV is open in another program (e.g. Excel). The log is safe.
+        print(f"  warning: could not replace {RESPONSES_CSV.name} (open in another program?). "
+              f"Close it and run with --rebuild-csv.", file=sys.stderr)
     return len(rows)
 
 
@@ -183,12 +211,18 @@ def main():
             print(f"===== {agent} | system prompt =====\n{SYSTEM_PROMPTS[agent]}\n")
         print(f"===== user message (scenario {s['scenario_id']}) =====\n{build_user_message(s)}\n")
         print(f"Would make {len(scenarios) * len(AGENTS)} calls to {MODEL} at temperature {TEMPERATURE}.")
+        lock_error = check_prompt_lock()
+        print(f"Prompt hash {PROMPT_HASH}: " + (lock_error or "matches prompts.lock (frozen)."))
         return
 
     if args.rebuild_csv:
         n = rebuild_csv(load_log())
         print(f"Rebuilt {RESPONSES_CSV} with {n} rows.")
         return
+
+    lock_error = check_prompt_lock()
+    if lock_error:
+        sys.exit(lock_error)
 
     if not os.environ.get("ANTHROPIC_API_KEY"):
         sys.exit("ANTHROPIC_API_KEY is not set. See README.md > 'Configure the API key'.")
@@ -201,9 +235,8 @@ def main():
     if other and not args.allow_mixed_prompts:
         sys.exit(f"{RAW_JSONL.name} contains responses made with different prompts "
                  f"(prompt hash {', '.join(other)}; current {PROMPT_HASH}).\n"
-                 "Move it aside so the dataset uses one prompt version, e.g.\n"
-                 f"  mv data/{RAW_JSONL.name} data/pilot_raw_responses_old_prompts.jsonl\n"
-                 "or pass --allow-mixed-prompts to override.")
+                 "Archive it (move it into data/archive/) so the dataset uses one prompt "
+                 "version, or pass --allow-mixed-prompts to override (not recommended).")
     done = {(int(r["scenario_id"]), r["agent_type"]) for r in records if r["status"] in TERMINAL_STATUSES}
     tries = {}
     for r in records:

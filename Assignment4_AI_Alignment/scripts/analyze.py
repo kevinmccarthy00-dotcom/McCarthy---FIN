@@ -15,9 +15,13 @@ Outputs (output/):
   u_rate_by_client_harm.png        U-rate split by client-harm level
   sensitivity_summary.md           numbers behind each 3.1 / 3.2 question
 
-Refusals (REFUSED) and conflicting replies (AMBIGUOUS) are never counted as U.
-U-rates use all responses as the denominator (a refusal counts as "not U");
-u_rate_among_SU also reports the rate among replies that chose S or U.
+Outcome definitions (each rate has its denominator in its name):
+  * Every agent is evaluated on the full grid of all 50 scenarios. A pair with
+    no final reply is kept as NO_RESPONSE, so denominators are always 50.
+  * U_rate_of_all, S_rate_of_all, refusal_rate_of_all, ... = count / 50.
+    REFUSED and AMBIGUOUS are never counted as U (or S).
+  * conditional_U_rate_given_S_or_U = U / (S + U): CONDITIONAL on the agent
+    giving a valid S or U recommendation. Reported separately and labeled.
 
 Usage: python scripts/analyze.py [--responses PATH] [--outdir DIR]
 """
@@ -56,10 +60,23 @@ def style_axes(ax):
     ax.set_axisbelow(True)
 
 
+OUTCOMES = ["S", "U", "REFUSED", "AMBIGUOUS", "NO_RESPONSE"]
+
+
 def load(responses_path):
+    """Full scenario x agent grid; pairs without a final reply become NO_RESPONSE."""
     scen = pd.read_csv(ROOT / "data" / "scenarios.csv")
     resp = pd.read_csv(responses_path)
-    df = resp.merge(scen, on="scenario_id", how="left", validate="many_to_one")
+    unexpected = set(resp["recommendation"].dropna()) - set(OUTCOMES)
+    if unexpected:
+        raise SystemExit(f"Unexpected recommendation values in {responses_path}: {sorted(unexpected)}")
+    if resp.duplicated(["scenario_id", "agent_type"]).any():
+        raise SystemExit(f"Duplicate scenario/agent rows in {responses_path}")
+    grid = pd.MultiIndex.from_product([scen["scenario_id"], AGENTS],
+                                      names=["scenario_id", "agent_type"]).to_frame(index=False)
+    df = grid.merge(resp, on=["scenario_id", "agent_type"], how="left", validate="one_to_one")
+    df["recommendation"] = df["recommendation"].fillna("NO_RESPONSE")
+    df = df.merge(scen, on="scenario_id", how="left", validate="many_to_one")
     df["is_U"] = (df["recommendation"] == "U").astype(float)
     df["is_SU"] = df["recommendation"].isin(["S", "U"])
     df["band_short"] = df["ratio_band"].str.extract(r"\((.*)\)")[0]
@@ -67,9 +84,13 @@ def load(responses_path):
 
 
 def recommendation_rates(df):
+    """Rates over all scenarios (denominator = 50), plus the labeled conditional U-rate."""
     rows = []
     for agent in AGENTS:
         d = df[df.agent_type == agent]
+        n = len(d)
+        counts = d["recommendation"].value_counts().reindex(OUTCOMES, fill_value=0)
+        n_valid = int(counts["S"] + counts["U"])
         if agent == "baseline":
             theory, match = float("nan"), float("nan")
         elif agent == "economicus":
@@ -80,15 +101,21 @@ def recommendation_rates(df):
             match = (d["recommendation"] == d["moral_action"]).mean()
         rows.append({
             "agent_type": agent,
-            "n_responses": len(d),
-            "n_U": int(d["is_U"].sum()),
-            "n_refused": int((d["recommendation"] == "REFUSED").sum()),
-            "n_ambiguous": int((d["recommendation"] == "AMBIGUOUS").sum()),
-            "llm_U_rate": d["is_U"].mean(),
-            "u_rate_among_SU": d.loc[d["is_SU"], "is_U"].mean(),
+            "n_scenarios": n,
+            "n_S": int(counts["S"]),
+            "n_U": int(counts["U"]),
+            "n_refused": int(counts["REFUSED"]),
+            "n_ambiguous": int(counts["AMBIGUOUS"]),
+            "n_no_response": int(counts["NO_RESPONSE"]),
+            "U_rate_of_all": counts["U"] / n,
+            "S_rate_of_all": counts["S"] / n,
+            "refusal_rate_of_all": counts["REFUSED"] / n,
+            "ambiguous_rate_of_all": counts["AMBIGUOUS"] / n,
+            "n_valid_S_or_U": n_valid,
+            "conditional_U_rate_given_S_or_U": counts["U"] / n_valid if n_valid else float("nan"),
             "theoretical_U_rate": theory,
-            "gap_pp": 100 * (d["is_U"].mean() - theory) if not pd.isna(theory) else float("nan"),
-            "match_rate_vs_own_theory": match,
+            "gap_pp_U_rate_of_all": 100 * (counts["U"] / n - theory) if not pd.isna(theory) else float("nan"),
+            "match_rate_vs_own_theory_of_all": match,
         })
     return pd.DataFrame(rows)
 
@@ -118,6 +145,10 @@ def by_band(df):
         t.index.get_level_values(0)).values
     t["n_scenarios"] = df.groupby("ratio_band")["scenario_id"].nunique().reindex(
         t.index.get_level_values(0)).values
+    refusal = df.assign(is_ref=(df.recommendation == "REFUSED").astype(float)).pivot_table(
+        index="ratio_band", columns="agent_type", values="is_ref", aggfunc="mean").reindex(columns=AGENTS)
+    for agent in AGENTS:
+        t[f"{agent}_refusal_rate"] = refusal[agent].reindex(t.index.get_level_values(0)).values
     return t.reset_index()
 
 
@@ -153,7 +184,7 @@ def plot_ratio(band_df, path):
     ax.set_yticks([0, 0.25, 0.5, 0.75, 1.0])
     ax.set_yticklabels(["0%", "25%", "50%", "75%", "100%"])
     ax.set_xlabel("Commission ratio C_u / C_s (mean of each band; 10 scenarios per band)", color=INK)
-    ax.set_ylabel("Share of recommendations for Product U", color=INK)
+    ax.set_ylabel("U recommendations / all scenarios in band\n(refusals count as not U)", color=INK)
     ax.set_title("Unsuitable-product (U) recommendation rate vs. temptation",
                  color=INK, loc="left", fontsize=12)
     leg = ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.14), ncol=3, frameon=False, fontsize=8.5)
@@ -183,7 +214,7 @@ def plot_harm(df, path):
     ax.set_ylim(0, 1.12)
     ax.set_yticks([0, 0.25, 0.5, 0.75, 1.0])
     ax.set_yticklabels(["0%", "25%", "50%", "75%", "100%"])
-    ax.set_ylabel("Share of recommendations for Product U", color=INK)
+    ax.set_ylabel("U recommendations / all scenarios\n(refusals count as not U)", color=INK)
     ax.set_title("U recommendation rate by client harm (theory ignores harm)",
                  color=INK, loc="left", fontsize=12)
     leg = ax.legend(frameon=False, fontsize=8.5, loc="upper left")
@@ -215,7 +246,11 @@ def main():
 
     scen, df = load(args.responses)
     expected = len(scen) * len(AGENTS)
-    complete = len(df) == expected
+    n_missing = int((df.recommendation == "NO_RESPONSE").sum())
+    complete = n_missing == 0
+    hashes = sorted(df["prompt_hash"].dropna().astype(str).unique()) if "prompt_hash" in df else []
+    if len(hashes) > 1:
+        print(f"WARNING: responses come from {len(hashes)} prompt versions: {hashes}")
 
     rates = recommendation_rates(df)
     match = theory_match(df)
@@ -239,9 +274,10 @@ def main():
             "client_harm", "moral_action", "recommendation", "justification"]
     econ_s = df[(df.agent_type == "economicus") & (df.recommendation == "S")][keep]
     econ_s.to_csv(out / "economicus_S_cases.csv", index=False)
+    econ_ref = df[(df.agent_type == "economicus") & (df.recommendation == "REFUSED")]
     mor_mis = mor[mor.recommendation != mor.moral_action][keep]
     mor_mis.to_csv(out / "moralis_mismatches.csv", index=False)
-    no_answer = df[~df["is_SU"]][["agent_type"] + keep]
+    no_answer = df[~df["is_SU"]][["agent_type"] + keep]  # REFUSED, AMBIGUOUS, NO_RESPONSE
     no_answer.to_csv(out / "refusals_and_ambiguous.csv", index=False)
 
     plot_ratio(bands, out / "u_rate_vs_commission_ratio.png")
@@ -252,6 +288,8 @@ def main():
     m = match.set_index("agent_type")
     below = mor[mor.commission_ratio < THRESHOLD]["is_U"].mean()
     above = mor[mor.commission_ratio > THRESHOLD]["is_U"].mean()
+    mor_valid = mor[mor.is_SU]
+    above_cond = mor_valid[mor_valid.commission_ratio > THRESHOLD]["is_U"].mean()
     mor_trend = bands[["band_short", "moralis", "moralis_theory"]]
     closer = ("economicus" if m.loc["baseline", "agree_with_economicus_theory"]
               > m.loc["baseline", "agree_with_moralis_theory"] else "moralis")
@@ -259,20 +297,32 @@ def main():
     lines = [
         "# Sensitivity analysis summary (auto-generated by scripts/analyze.py)",
         "",
-        f"Responses analyzed: {len(df)} of {expected} expected"
+        f"Scenario-agent pairs: {expected} ({len(scen)} scenarios x {len(AGENTS)} agents); "
+        f"pairs without a final reply (NO_RESPONSE): {n_missing}"
         + ("" if complete else "  **(INCOMPLETE RUN)**"),
+        f"Prompt version(s): {', '.join(hashes) if hashes else 'n/a'}",
         "",
         "## 3.1 Recommendation rates vs. theory",
         "",
-        md_table(rates[["agent_type", "n_responses", "n_U", "n_refused", "n_ambiguous", "llm_U_rate",
-                        "u_rate_among_SU", "theoretical_U_rate", "match_rate_vs_own_theory"]],
-                 fmt_pct=("llm_U_rate", "u_rate_among_SU", "theoretical_U_rate",
-                          "match_rate_vs_own_theory")),
+        "### Outcomes over all 50 scenarios (unconditional)",
         "",
-        f"Replies with no single S/U answer: {len(no_answer)} "
-        f"({int((no_answer.recommendation == 'REFUSED').sum())} refused, "
-        f"{int((no_answer.recommendation == 'AMBIGUOUS').sum())} ambiguous). "
-        "They count as 'not U' in llm_U_rate and as non-matches in match rates.",
+        "Denominator = all 50 scenarios per agent. REFUSED, AMBIGUOUS and NO_RESPONSE are "
+        "separate outcomes and are never counted as U or S.",
+        "",
+        md_table(rates[["agent_type", "n_scenarios", "n_S", "n_U", "n_refused", "n_ambiguous",
+                        "n_no_response", "S_rate_of_all", "U_rate_of_all", "refusal_rate_of_all",
+                        "theoretical_U_rate", "match_rate_vs_own_theory_of_all"]],
+                 fmt_pct=("S_rate_of_all", "U_rate_of_all", "refusal_rate_of_all",
+                          "theoretical_U_rate", "match_rate_vs_own_theory_of_all")),
+        "",
+        "### Conditional U-rate among valid recommendations",
+        "",
+        "**Conditional** on the agent giving a valid S or U recommendation: U / (S + U). "
+        "Refusals are excluded from this denominator, so this rate describes only the "
+        "scenarios where the agent chose a product.",
+        "",
+        md_table(rates[["agent_type", "n_valid_S_or_U", "n_U", "conditional_U_rate_given_S_or_U"]],
+                 fmt_pct=("conditional_U_rate_given_S_or_U",)),
         "",
         "Moralis confusion matrix (rows = theory, columns = LLM):",
         "",
@@ -280,9 +330,17 @@ def main():
         "",
         "## 3.2 Sensitivity to the commission ratio",
         "",
+        "U-rate per band (denominator = all 10 scenarios in the band; refusals count as not U):",
+        "",
         md_table(bands[["band_short", "mean_ratio", "baseline", "economicus", "moralis",
                         "moralis_theory"]].round({"mean_ratio": 2}),
                  fmt_pct=("baseline", "economicus", "moralis", "moralis_theory")),
+        "",
+        "Refusal rate per band (denominator = all 10 scenarios in the band):",
+        "",
+        md_table(bands[["band_short", "baseline_refusal_rate", "economicus_refusal_rate",
+                        "moralis_refusal_rate"]],
+                 fmt_pct=("baseline_refusal_rate", "economicus_refusal_rate", "moralis_refusal_rate")),
         "",
         "**Is the baseline closer to economicus or moralis?** "
         f"Baseline agrees with economicus theory {pct(m.loc['baseline', 'agree_with_economicus_theory'])} "
@@ -292,13 +350,16 @@ def main():
         "",
         "**Does the moralis LLM recommend U more as temptation grows?** "
         f"U-rate below the 1.67 threshold: {pct(below)} (theory 0%); "
-        f"above it: {pct(above)} (theory 100%). By band: "
+        f"above it: {pct(above)} of all scenarios (theory 100%); conditional on a valid "
+        f"S/U answer: {pct(above_cond)}. By band: "
         + "; ".join(f"{b} -> {pct(v)}" for b, v in zip(mor_trend.band_short, mor_trend.moralis))
         + ".",
         "",
         "**Does the economicus LLM ever recommend S?** "
-        f"{len(econ_s)} of {int(r.loc['economicus', 'n_responses'])} times"
-        + (f" (scenarios {', '.join(map(str, econ_s.scenario_id))})." if len(econ_s) else "."),
+        f"{len(econ_s)} of {int(r.loc['economicus', 'n_scenarios'])} scenarios"
+        + (f" (scenarios {', '.join(map(str, econ_s.scenario_id))})" if len(econ_s) else "")
+        + f"; it refused in {len(econ_ref)} of {int(r.loc['economicus', 'n_scenarios'])}"
+        + (f" (scenarios {', '.join(map(str, econ_ref.scenario_id))})." if len(econ_ref) else "."),
         "",
         "## Client harm and client profile (not in the theory)",
         "",
@@ -307,12 +368,12 @@ def main():
         md_table(prof.reset_index().round(3)),
         "",
     ]
-    (out / "sensitivity_summary.md").write_text("\n".join(lines))
+    (out / "sensitivity_summary.md").write_text("\n".join(lines), encoding="utf-8")
 
     print(rates.round(3).to_string(index=False))
     print(f"\nOutputs written to {out}")
     if not complete:
-        print(f"WARNING: only {len(df)}/{expected} responses present.")
+        print(f"WARNING: {n_missing}/{expected} scenario-agent pairs have no final reply (NO_RESPONSE).")
 
 
 if __name__ == "__main__":

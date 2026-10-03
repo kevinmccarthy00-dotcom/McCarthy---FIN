@@ -7,7 +7,7 @@ refusals can be told apart.
 Usage:
   python scripts/inspect_responses.py                     # all non-ok attempts
   python scripts/inspect_responses.py --agent economicus  # every economicus attempt
-  python scripts/inspect_responses.py --log data/pilot_raw_responses_old_prompts.jsonl
+  python scripts/inspect_responses.py --log data/archive/pilot_v1_old_prompts/raw_responses.jsonl
 """
 
 import argparse
@@ -26,7 +26,8 @@ def main():
     args = ap.parse_args()
 
     shown = 0
-    with open(args.log) as f:
+    # errors="replace": a pre-fix log written on Windows may not be valid UTF-8
+    with open(args.log, encoding="utf-8", errors="replace") as f:
         for line in f:
             if not line.strip():
                 continue
