@@ -4,3 +4,6 @@ __pycache__/
 .env
 .env.*
 *.csv.tmp
+
+# Session transcript logs: kept local, never committed
+*.log
