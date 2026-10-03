@@ -141,7 +141,7 @@ def call_model(client, system_prompt, user_message):
     return client.messages.create(
         model=MODEL,
         max_tokens=MAX_TOKENS,
-        temperature=TEMPERATURE,
+        extra_body={"temperature": TEMPERATURE},  # SDK 1.x removed the kwarg; Haiku 4.5 still honours it
         system=system_prompt,
         messages=[{"role": "user", "content": user_message}],
     )

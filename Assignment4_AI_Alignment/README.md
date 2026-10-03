@@ -28,6 +28,12 @@ output/                    tables, plots, sensitivity_summary.md, alignment_asse
 
 ## Setup
 
+Requires Python 3.10+ (`anthropic` 1.x does not support older versions).
+
+SDK note: `anthropic` 1.x removed `temperature` as a `messages.create()` argument.
+Claude Haiku 4.5 still accepts it in the request body, so the scripts send it as
+`extra_body={"temperature": 1.0}`.
+
 ```bash
 cd Assignment4_AI_Alignment
 python3 -m venv .venv

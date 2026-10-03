@@ -27,7 +27,7 @@ def main():
         resp = client.messages.create(
             model=MODEL,
             max_tokens=10,
-            temperature=1.0,
+            extra_body={"temperature": 1.0},
             messages=[{"role": "user", "content": "Reply with the single word: OK"}],
         )
     except anthropic.AuthenticationError:
